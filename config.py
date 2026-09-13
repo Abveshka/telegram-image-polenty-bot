@@ -23,6 +23,11 @@ NANO_BANANA_MODEL = os.getenv("NANO_BANANA_MODEL", "gemini-3-pro-image")
 IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1K")
 ASPECT_RATIO = os.getenv("ASPECT_RATIO", "1:1")
 
+# Например: http://127.0.0.1:10809. Нужен, когда VPN работает в
+# proxy-режиме, а не в TUN-режиме: aiohttp не использует системный прокси
+# Windows автоматически.
+TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL") or None
+
 PRICE_PER_GENERATION_STARS = 10
 STAR_PACKAGES = [
     {"label": "100 ★ → 10 генераций", "stars_to_pay": 100, "credit_stars": 100},
