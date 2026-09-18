@@ -1,19 +1,14 @@
+import logging
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
-
+from sqlalchemy.exc import IntegrityError
 from database import async_session, User, Transaction
 import config
 
+logger = logging.getLogger(__name__)
 
 async def get_or_create_user(telegram_id: int, username: str | None) -> User:
-    """
-    Находит пользователя по telegram_id, либо создаёт нового с балансом 0,
-    если он пишет боту впервые. Это и есть "регистрация" — без отдельной
-    команды, прозрачно для пользователя.
-    """
     async with async_session() as session:
-        # Два сообщения от нового пользователя могут прийти почти одновременно.
-        # INSERT .. ON CONFLICT не допускает падения на UNIQUE telegram_id.
         created = await session.scalar(
             insert(User)
             .values(telegram_id=telegram_id, username=username, balance=0)
@@ -27,14 +22,22 @@ async def get_or_create_user(telegram_id: int, username: str | None) -> User:
         user = await session.scalar(
             select(User).where(User.telegram_id == telegram_id)
         )
-        if user is None:  # Защита от неконсистентного состояния БД.
+        if user is None:
             raise RuntimeError(f"Не удалось получить пользователя {telegram_id}")
         return user
 
 
 async def get_balance(telegram_id: int) -> int:
-    user = await get_or_create_user(telegram_id, username=None)
-    return user.balance
+    async with async_session() as session:
+        balance = await session.scalar(
+            select(User.balance).where(User.telegram_id == telegram_id)
+        )
+        if balance is None:
+            raise RuntimeError(
+                f"get_balance: пользователь {telegram_id} не найден — "
+                f"вызовите get_or_create_user перед get_balance"
+            )
+        return balance
 
 
 async def has_enough_balance(telegram_id: int) -> bool:
@@ -43,53 +46,67 @@ async def has_enough_balance(telegram_id: int) -> bool:
 
 
 async def charge_for_generation(telegram_id: int) -> bool:
-    """
-    Списывает стоимость одной генерации с баланса пользователя
-    и записывает это как транзакцию. Вызывается ТОЛЬКО после того,
-    как изображение уже успешно сгенерировано — чтобы не списывать
-    деньги за неудачную попытку.
-    """
+    price = config.PRICE_PER_GENERATION_STARS
     async with async_session() as session:
-        # Условие в UPDATE делает списание атомарным. Иначе несколько
-        # параллельных генераций могли бы списать баланс ниже нуля.
-        user_id = await session.scalar(
+        result = await session.execute(
             update(User)
-            .where(
-                User.telegram_id == telegram_id,
-                User.balance >= config.PRICE_PER_GENERATION_STARS,
-            )
-            .values(balance=User.balance - config.PRICE_PER_GENERATION_STARS)
+            .where(User.telegram_id == telegram_id, User.balance >= price)
+            .values(balance=User.balance - price)
             .returning(User.id)
         )
-        if user_id is None:
-            await session.rollback()
+        row = result.first()
+        if row is None:
             return False
 
-        session.add(Transaction(
-            user_id=user_id,
-            amount=-config.PRICE_PER_GENERATION_STARS,
-            type="generation",
-        ))
+        await session.execute(
+            insert(Transaction).values(user_id=row[0], amount=-price, type="generation")
+        )
         await session.commit()
         return True
 
+async def refund_generation(telegram_id: int) -> None:
+    """Возвращает один заранее списанный кредит после ошибки генерации."""
+    price = config.PRICE_PER_GENERATION_STARS
+    async with async_session() as session:
+        result = await session.execute(
+            update(User)
+            .where(User.telegram_id == telegram_id)
+            .values(balance=User.balance + price)
+            .returning(User.id)
+        )
+        row = result.first()
+        if row is None:
+            logger.error(f"refund_generation: пользователь {telegram_id} не найден")
+            return
 
-async def credit_balance(telegram_id: int, username: str | None, stars_amount: int) -> None:
-    """
-    Начисляет звёзды на баланс после успешной оплаты через Telegram Stars.
-    """
+        await session.execute(
+            insert(Transaction).values(user_id=row[0], amount=price, type="refund")
+        )
+        await session.commit()
+
+
+async def credit_balance(telegram_id: int, username: str | None, stars_amount: int, charge_id: str) -> None:
+    """Начисляет кредит ровно один раз для уникального платежа Telegram."""
     user = await get_or_create_user(telegram_id, username)
 
     async with async_session() as session:
-        result = await session.execute(
-            select(User).where(User.telegram_id == telegram_id)
-        )
-        user = result.scalar_one()
+        try:
+            async with session.begin_nested():
+                await session.execute(
+                    insert(Transaction).values(
+                        user_id=user.id,
+                        amount=stars_amount,
+                        type="payment",
+                        telegram_payment_charge_id=charge_id,
+                    )
+                )
+        except IntegrityError:
+            return
 
-        user.balance += stars_amount
-        session.add(Transaction(
-            user_id=user.id,
-            amount=stars_amount,
-            type="payment",
-        ))
+        await session.execute(
+            update(User)
+            .where(User.telegram_id == telegram_id)
+            .values(balance=User.balance + stars_amount)
+        )
+
         await session.commit()
