@@ -3,7 +3,7 @@ from aiogram import Router, F
 from aiogram.types import ErrorEvent, Message
 from aiogram.filters import CommandStart
 from aiogram.types import BufferedInputFile
-
+import time
 import config
 from user_service import (
     get_or_create_user,
@@ -24,6 +24,13 @@ from aiogram.filters import Command, CommandObject
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
+
+GENERATION_COOLDOWN_SECONDS = 10
+_active_generations: set[int] = set()
+_last_generation_at: dict[int, float] = {}
+
+BUY_COOLDOWN_SECONDS = 10
+_last_buy_at: dict[int, float] = {}
 
 logger = logging.getLogger(__name__)
 
@@ -47,22 +54,32 @@ async def handle_start(message: Message) -> None:
         "Например: «кот-космонавт на скейтборде»"
     )
 
-@router.message(Command("generate"))
-async def handle_generate_prompt(message: Message, command: CommandObject) -> None:
-    prompt = command.args
-
-    if not prompt:
-        await message.answer(
-            "Укажите текст после команды, например:\n"
-            "/generate кот-космонавт на скейтборде"
+async def report_failed_generation(
+    bot: Bot, telegram_id: int, username: str | None, prompt: str, error: Exception | str
+) -> None:
+    """Фиксирует сбой генерации для ручной сверки. Деньги не возвращает."""
+    logger.error(
+        "СБОЙ ГЕНЕРАЦИИ (звёзды списаны): user=%s, username=%s, prompt=%r, error=%r",
+        telegram_id, username, prompt, error,
+    )
+    try:
+        await bot.send_message(
+            config.ADMIN_ID,
+            f"⚠️ Сбой генерации, звёзды списаны\n"
+            f"user: {telegram_id} (@{username})\n"
+            f"промпт: {prompt}\n"
+            f"ошибка: {error!r}",
         )
-        return
+    except Exception:
+        logger.exception("Не удалось отправить уведомление админу")
 
+async def _run_generation(message: Message, prompt: str, bot: Bot) -> None:
     if message.from_user is None:
         return
 
     telegram_id = message.from_user.id
-    await get_or_create_user(telegram_id, message.from_user.username)
+    username = message.from_user.username
+    await get_or_create_user(telegram_id, username)
 
     if not await charge_for_generation(telegram_id):
         balance = await get_balance(telegram_id)
@@ -79,17 +96,64 @@ async def handle_generate_prompt(message: Message, command: CommandObject) -> No
     try:
         image_bytes = await provider.generate(prompt)
     except ImageGenerationError as error:
-        logger.warning("Ошибка генерации для промпта %r: %s", prompt, error)
-        #await refund_generation(telegram_id)
+        await report_failed_generation(bot, telegram_id, username, prompt, error)
         await status_message.edit_text(
             "Не получилось сгенерировать изображение. Попробуйте ещё раз "
             "или измените запрос."
         )
         return
+    except Exception as error:
+        await report_failed_generation(bot, telegram_id, username, prompt, error)
+        await status_message.edit_text(
+            "Произошла техническая ошибка при генерации. "
+            "Информация передана администратору."
+        )
+        return
 
-    photo = BufferedInputFile(image_bytes, filename="generated.png")
-    await message.answer_photo(photo, caption=f"«{prompt}»")
+    try:
+        photo = BufferedInputFile(image_bytes, filename="generated.png")
+        await message.answer_photo(photo, caption=f"«{prompt}»")
+    except Exception as error:
+        await report_failed_generation(bot, telegram_id, username, prompt, error)
+        await status_message.edit_text(
+            "Не удалось отправить изображение. Информация передана администратору."
+        )
+        return
+
     await status_message.delete()
+
+@router.message(Command("generate"))
+async def handle_generate_prompt(message: Message, command: CommandObject, bot: Bot) -> None:
+    prompt = command.args
+
+    if not prompt:
+        await message.answer(
+            "Укажите текст после команды, например:\n"
+            "/generate кот-космонавт на скейтборде"
+        )
+        return
+
+    if message.from_user is None:
+        return
+
+    telegram_id = message.from_user.id
+
+    if telegram_id in _active_generations:
+        await message.answer("Предыдущая генерация ещё выполняется. Дождитесь результата.")
+        return
+
+    elapsed = time.monotonic() - _last_generation_at.get(telegram_id, 0.0)
+    if elapsed < GENERATION_COOLDOWN_SECONDS:
+        wait = int(GENERATION_COOLDOWN_SECONDS - elapsed) + 1
+        await message.answer(f"Слишком часто. Подождите {wait} сек.")
+        return
+
+    _active_generations.add(telegram_id)
+    try:
+        await _run_generation(message, prompt, bot)
+    finally:
+        _active_generations.discard(telegram_id)
+        _last_generation_at[telegram_id] = time.monotonic()
 
 @router.error()
 async def log_update_error(event: ErrorEvent) -> bool:
@@ -99,6 +163,17 @@ async def log_update_error(event: ErrorEvent) -> bool:
 
 @router.message(Command("buy"))
 async def handle_buy(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    user_id = message.from_user.id
+    now = time.monotonic()
+    last = _last_buy_at.get(user_id)
+    if last is not None and now - last < BUY_COOLDOWN_SECONDS:
+        await message.answer("Счета уже отправлены выше. Подождите немного перед повтором.")
+        return
+    _last_buy_at[user_id] = now
+
     for package in config.STAR_PACKAGES:
         await message.answer_invoice(
             title=package["label"],
