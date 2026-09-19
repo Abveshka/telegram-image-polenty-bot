@@ -1,5 +1,5 @@
 import logging
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from database import async_session, User, Transaction
@@ -109,4 +109,71 @@ async def credit_balance(telegram_id: int, username: str | None, stars_amount: i
             .values(balance=User.balance + stars_amount)
         )
 
+        await session.commit()
+
+async def reserve_payment_refund(charge_id: str) -> tuple[int, int]:
+    """
+    Списывает с баланса кредиты за платёж и пишет транзакцию возврата.
+    Возвращает (telegram_id, сумма). При проблеме бросает ValueError с понятным текстом.
+    """
+    async with async_session() as session:
+        row = (
+            await session.execute(
+                select(Transaction.user_id, Transaction.amount, User.telegram_id)
+                .join(User, User.id == Transaction.user_id)
+                .where(
+                    Transaction.telegram_payment_charge_id == charge_id,
+                    Transaction.type == "payment",
+                )
+            )
+        ).first()
+        if row is None:
+            raise ValueError("Платёж с таким charge_id не найден")
+        user_id, amount, telegram_id = row
+
+        try:
+            async with session.begin_nested():
+                await session.execute(
+                    insert(Transaction).values(
+                        user_id=user_id,
+                        amount=-amount,
+                        type="payment_refund",
+                        # charge_id уникален, поэтому у возврата свой ключ.
+                        # Он же защищает от повторного возврата.
+                        telegram_payment_charge_id=f"refund:{charge_id}",
+                    )
+                )
+        except IntegrityError:
+            raise ValueError("Этот платёж уже возвращён")
+
+        result = await session.execute(
+            update(User)
+            .where(User.id == user_id, User.balance >= amount)
+            .values(balance=User.balance - amount)
+            .returning(User.id)
+        )
+        if result.first() is None:
+            await session.rollback()
+            raise ValueError(
+                "На балансе пользователя меньше, чем нужно списать "
+                "(часть генераций уже потрачена)"
+            )
+
+        await session.commit()
+        return telegram_id, amount
+
+
+async def undo_payment_refund(charge_id: str, telegram_id: int, amount: int) -> None:
+    """Откатывает reserve_payment_refund, если Telegram не смог вернуть звёзды."""
+    async with async_session() as session:
+        await session.execute(
+            delete(Transaction).where(
+                Transaction.telegram_payment_charge_id == f"refund:{charge_id}"
+            )
+        )
+        await session.execute(
+            update(User)
+            .where(User.telegram_id == telegram_id)
+            .values(balance=User.balance + amount)
+        )
         await session.commit()

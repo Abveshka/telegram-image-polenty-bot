@@ -12,6 +12,9 @@ from user_service import (
     charge_for_generation,
     refund_generation,
     credit_balance,
+    reserve_payment_refund,
+    undo_payment_refund,
+
 )
 from providers.base import ImageGenerationError
 from providers.mock_provider import MockImageProvider
@@ -19,14 +22,15 @@ from providers.nano_banana_provider import NanoBananaProvider
 from aiogram.types import LabeledPrice, PreCheckoutQuery
 from aiogram.filters import Command, CommandObject
 
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
+
 logger = logging.getLogger(__name__)
 
 router = Router()
 
-# Выбор провайдера происходит один раз при старте бота,
-# на основе переменной USE_MOCK_IMAGE из .env.
-# Именно это и есть "переключение одной переменной окружения"
-# из исходной архитектуры проекта.
+PACKAGES_BY_PAYLOAD = {f"stars_{p['credit_stars']}": p for p in config.STAR_PACKAGES}
+
 if config.USE_MOCK_IMAGE:
     provider = MockImageProvider()
     logger.info("Используется MockImageProvider (бесплатный тестовый режим)")
@@ -106,11 +110,16 @@ async def handle_buy(message: Message) -> None:
 
 
 @router.pre_checkout_query()
-async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
-    # Telegram обязательно требует подтверждения ("ок, можно списывать деньги")
-    # в течение 10 секунд после того, как пользователь нажал "Оплатить".
-    # Без явного ok=True платёж автоматически отклоняется Telegram.
-    await pre_checkout_query.answer(ok=True)
+async def handle_pre_checkout(query: PreCheckoutQuery) -> None:
+    package = PACKAGES_BY_PAYLOAD.get(query.invoice_payload)
+    if (
+        package is None
+        or query.currency != "XTR"
+        or query.total_amount != package["stars_to_pay"]
+    ):
+        await query.answer(ok=False, error_message="Пакет недоступен, откройте /buy заново")
+        return
+    await query.answer(ok=True)
 
 
 @router.message(F.successful_payment)
@@ -118,18 +127,72 @@ async def handle_successful_payment(message: Message) -> None:
     if message.from_user is None or message.successful_payment is None:
         return
 
-    payload = message.successful_payment.invoice_payload
+    payment = message.successful_payment  # <-- добавлено
+    payload = payment.invoice_payload
     credit_stars = int(payload.replace("stars_", ""))
 
-    await credit_balance(
-        telegram_id=message.from_user.id,
-        username=message.from_user.username,
-        stars_amount=credit_stars,
-        charge_id=message.successful_payment.telegram_payment_charge_id,
-    )
+    try:
+        await credit_balance(
+            telegram_id=message.from_user.id,
+            username=message.from_user.username,
+            stars_amount=credit_stars,
+            charge_id=payment.telegram_payment_charge_id,
+        )
+    except Exception:
+        logger.critical(
+            "ОПЛАТА НЕ НАЧИСЛЕНА: user=%s, кредиты=%s, charge_id=%s",
+            message.from_user.id, credit_stars, payment.telegram_payment_charge_id,
+            exc_info=True,
+        )
+        await message.answer(
+            "Оплата получена, но при начислении произошёл сбой. "
+            "Мы разберёмся и начислим вручную."
+        )
+        return
 
     balance = await get_balance(message.from_user.id)
     await message.answer(
         f"Оплата прошла успешно! Начислено {credit_stars} ★.\n"
         f"Текущий баланс: {balance} ★"
     )
+
+@router.message(Command("balance"))
+async def handle_balance(message: Message) -> None:
+    if message.from_user is None:
+        return
+    await get_or_create_user(message.from_user.id, message.from_user.username)
+    balance = await get_balance(message.from_user.id)
+    await message.answer(
+        f"Баланс: {balance} ★ (≈ {balance // config.PRICE_PER_GENERATION_STARS} генераций)"
+    )
+
+@router.message(Command("refund"))
+async def handle_refund(message: Message, command: CommandObject, bot: Bot) -> None:
+    # Только для вас: иначе любой пользователь сможет вернуть чужие платежи
+    if message.from_user is None or message.from_user.id != config.ADMIN_ID:
+        return
+
+    if not command.args:
+        await message.answer("Использование: /refund <charge_id>")
+        return
+
+    charge_id = command.args.strip()
+
+    try:
+        telegram_id, amount = await reserve_payment_refund(charge_id)
+    except ValueError as error:
+        await message.answer(f"Возврат невозможен: {error}")
+        return
+
+    try:
+        await bot.refund_star_payment(
+            user_id=telegram_id,
+            telegram_payment_charge_id=charge_id,
+        )
+    except TelegramAPIError as error:
+        logger.exception("Telegram не вернул звёзды по платежу %s", charge_id)
+        await undo_payment_refund(charge_id, telegram_id, amount)
+        await message.answer(f"Telegram отклонил возврат, баланс восстановлен: {error}")
+        return
+
+    await message.answer(f"Готово: звёзды возвращены, с баланса списано {amount} ★")

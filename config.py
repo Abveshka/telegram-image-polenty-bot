@@ -27,9 +27,11 @@ ASPECT_RATIO = os.getenv("ASPECT_RATIO", "1:1")
 # proxy-режиме, а не в TUN-режиме: aiohttp не использует системный прокси
 # Windows автоматически.
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL") or None
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 PRICE_PER_GENERATION_STARS = 10
 STAR_PACKAGES = [
+    #{"label": "TEST 1 ★ → 1 генерация", "stars_to_pay": 1, "credit_stars": 10}, тест
     {"label": "100 ★ → 10 генераций", "stars_to_pay": 100, "credit_stars": 100},
     {"label": "500 ★ → 55 генераций (+5 бонус)", "stars_to_pay": 500, "credit_stars": 550},
     {"label": "1000 ★ → 120 генераций (+20 бонус)", "stars_to_pay": 1000, "credit_stars": 1200},
