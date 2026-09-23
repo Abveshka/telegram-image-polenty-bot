@@ -18,16 +18,17 @@ TELEGRAM_BOT_TOKEN = _get_required("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = _get_required("GEMINI_API_KEY")
 DATABASE_URL = _get_required("DATABASE_URL")
 
-USE_MOCK_IMAGE = os.getenv("USE_MOCK_IMAGE", "true").lower() == "true"
 NANO_BANANA_MODEL = os.getenv("NANO_BANANA_MODEL", "gemini-3-pro-image")
 IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1K")
 ASPECT_RATIO = os.getenv("ASPECT_RATIO", "1:1")
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
 # Например: http://127.0.0.1:10809. Нужен, когда VPN работает в
 # proxy-режиме, а не в TUN-режиме: aiohttp не использует системный прокси
 # Windows автоматически.
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL") or None
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+OPENROUTER_MANAGEMENT_KEY = os.environ["OPENROUTER_MANAGEMENT_KEY"]
 
 PRICE_PER_GENERATION_STARS = 10
 STAR_PACKAGES = [

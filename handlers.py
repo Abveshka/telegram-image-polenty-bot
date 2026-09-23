@@ -17,7 +17,6 @@ from user_service import (
 
 )
 from providers.base import ImageGenerationError
-from providers.mock_provider import MockImageProvider
 from providers.nano_banana_provider import NanoBananaProvider
 from aiogram.types import LabeledPrice, PreCheckoutQuery
 from aiogram.filters import Command, CommandObject
@@ -38,20 +37,16 @@ router = Router()
 
 PACKAGES_BY_PAYLOAD = {f"stars_{p['credit_stars']}": p for p in config.STAR_PACKAGES}
 
-if config.USE_MOCK_IMAGE:
-    provider = MockImageProvider()
-    logger.info("Используется MockImageProvider (бесплатный тестовый режим)")
-else:
-    provider = NanoBananaProvider()
-    logger.info("Используется NanoBananaProvider (платные запросы к Gemini API)")
+
+provider = NanoBananaProvider(api_key=config.OPENROUTER_API_KEY)
 
 @router.message(CommandStart())
 async def handle_start(message: Message) -> None:
     if message.from_user is not None:
         await get_or_create_user(message.from_user.id, message.from_user.username)
     await message.answer(
-        "Привет! Отправь мне текстовое описание, и я сгенерирую по нему изображение.\n\n"
-        "Например: «кот-космонавт на скейтборде»"
+        "Привет! Отправь мне /generate и текстовое описание, а я сгенерирую по нему изображение.\n\n"
+        "Например: «/generate кот-космонавт на скейтборде»"
     )
 
 async def report_failed_generation(
@@ -271,3 +266,42 @@ async def handle_refund(message: Message, command: CommandObject, bot: Bot) -> N
         return
 
     await message.answer(f"Готово: звёзды возвращены, с баланса списано {amount} ★")
+
+@router.message(Command("compensate"))
+async def handle_compensate(message: Message, command: CommandObject) -> None:
+    """Начисляет звёзды на внутренний баланс юзера в качестве компенсации за сбой по нашей вине."""
+    if message.from_user is None or message.from_user.id != config.ADMIN_ID:
+        return
+
+    if not command.args:
+        await message.answer("Использование: /compensate <telegram_id> <количество>\nНапример: /compensate 1498757244 10")
+        return
+
+    parts = command.args.split()
+    if len(parts) != 2 or not all(p.lstrip("-").isdigit() for p in parts):
+        await message.answer("Использование: /compensate <telegram_id> <количество>")
+        return
+
+    target_id, amount = int(parts[0]), int(parts[1])
+    if amount <= 0:
+        await message.answer("Количество должно быть положительным")
+        return
+
+    await credit_balance(
+        telegram_id=target_id,
+        username=None,
+        stars_amount=amount,
+        charge_id=f"compensation_{target_id}_{int(time.time())}",
+    )
+
+    balance = await get_balance(target_id)
+    await message.answer(f"Начислено {amount} ★ юзеру {target_id} (компенсация).\nЕго баланс теперь: {balance} ★")
+
+    try:
+        await message.bot.send_message(
+            target_id,
+            f"Приносим извинения за техническую проблему с генерацией. "
+            f"Вам начислено {amount} ★ в качестве компенсации.",
+        )
+    except Exception:
+        logger.warning("Не удалось уведомить юзера %s о компенсации", target_id)
