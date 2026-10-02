@@ -2,7 +2,7 @@ import asyncio
 import base64
 import logging
 import random
-
+from typing import Any
 import httpx
 
 from providers.base import ImageGenerationError, ImageProvider
@@ -15,7 +15,6 @@ IMAGE_MODEL = "google/gemini-3.1-flash-image"
 MAX_RETRIES = 2
 BASE_BACKOFF = 1.5  # секунды
 MAX_CONCURRENT_REQUESTS = 15  # общий лимит одновременных запросов к OpenRouter
-
 
 class NanoBananaProvider(ImageProvider):
     """Генерация изображений через Gemini (Nano Banana 2) по API OpenRouter."""
@@ -34,12 +33,42 @@ class NanoBananaProvider(ImageProvider):
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def generate(self, prompt: str) -> bytes:
+    async def generate(
+            self,
+            prompt: str,
+            reference_image: bytes | None = None,
+            media_type: str = "image/jpeg",
+    ) -> bytes:
         async with self._semaphore:
-            return await self._generate_with_retries(prompt)
+            return await self._generate_with_retries(
+                prompt,
+                reference_image,
+                media_type,
+            )
 
-    async def _generate_with_retries(self, prompt: str) -> bytes:
+    async def _generate_with_retries(
+            self,
+            prompt: str,
+            reference_image: bytes | None,
+            media_type: str,
+    ) -> bytes:
         last_error: Exception | None = None
+
+        payload: dict[str, Any] = {
+            "model": IMAGE_MODEL,
+            "prompt": prompt,
+        }
+
+        if reference_image is not None:
+            image_b64 = base64.b64encode(reference_image).decode("ascii")
+            payload["input_references"] = [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{media_type};base64,{image_b64}",
+                    },
+                }
+            ]
 
         for attempt in range(MAX_RETRIES + 1):
             try:
@@ -49,7 +78,7 @@ class NanoBananaProvider(ImageProvider):
                         "Authorization": f"Bearer {self._api_key}",
                         "Content-Type": "application/json",
                     },
-                    json={"model": IMAGE_MODEL, "prompt": prompt},
+                    json=payload,
                 )
 
                 if response.status_code == 402:

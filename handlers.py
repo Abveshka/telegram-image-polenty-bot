@@ -10,7 +10,6 @@ from user_service import (
     get_balance,
     has_enough_balance,
     charge_for_generation,
-    refund_generation,
     credit_balance,
     reserve_payment_refund,
     undo_payment_refund,
@@ -20,7 +19,7 @@ from providers.base import ImageGenerationError
 from providers.nano_banana_provider import NanoBananaProvider
 from aiogram.types import LabeledPrice, PreCheckoutQuery
 from aiogram.filters import Command, CommandObject
-
+from io import BytesIO
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
@@ -68,7 +67,14 @@ async def report_failed_generation(
     except Exception:
         logger.exception("Не удалось отправить уведомление админу")
 
-async def _run_generation(message: Message, prompt: str, bot: Bot) -> None:
+
+async def _run_generation(
+    message: Message,
+    prompt: str,
+    bot: Bot,
+    reference_image: bytes | None = None,
+    media_type: str = "image/jpeg",
+) -> None:
     if message.from_user is None:
         return
 
@@ -76,9 +82,11 @@ async def _run_generation(message: Message, prompt: str, bot: Bot) -> None:
     username = message.from_user.username
     await get_or_create_user(telegram_id, username)
 
+    status_message = await message.answer("Генерирую изображение...")
+
     if not await charge_for_generation(telegram_id):
         balance = await get_balance(telegram_id)
-        await message.answer(
+        await status_message.edit_text(
             f"Недостаточно звёзд для генерации.\n"
             f"Ваш баланс: {balance} ★\n"
             f"Стоимость генерации: {config.PRICE_PER_GENERATION_STARS} ★\n\n"
@@ -86,22 +94,24 @@ async def _run_generation(message: Message, prompt: str, bot: Bot) -> None:
         )
         return
 
-    status_message = await message.answer("Генерирую изображение...")
-
     try:
-        image_bytes = await provider.generate(prompt)
+        image_bytes = await provider.generate(
+            prompt,
+            reference_image=reference_image,
+            media_type=media_type,
+        )
     except ImageGenerationError as error:
         await report_failed_generation(bot, telegram_id, username, prompt, error)
         await status_message.edit_text(
-            "Не получилось сгенерировать изображение. Попробуйте ещё раз "
-            "или измените запрос."
+            "Не получилось сгенерировать изображение. Администратор уведомлён. "
+            "Попробуйте ещё раз или измените запрос."
         )
         return
     except Exception as error:
         await report_failed_generation(bot, telegram_id, username, prompt, error)
         await status_message.edit_text(
             "Произошла техническая ошибка при генерации. "
-            "Информация передана администратору."
+            "Администратор уведомлён."
         )
         return
 
@@ -111,7 +121,8 @@ async def _run_generation(message: Message, prompt: str, bot: Bot) -> None:
     except Exception as error:
         await report_failed_generation(bot, telegram_id, username, prompt, error)
         await status_message.edit_text(
-            "Не удалось отправить изображение. Информация передана администратору."
+            "Изображение создано, но Telegram не смог его отправить. "
+            "Администратор уведомлён."
         )
         return
 
@@ -305,3 +316,58 @@ async def handle_compensate(message: Message, command: CommandObject) -> None:
         )
     except Exception:
         logger.warning("Не удалось уведомить юзера %s о компенсации", target_id)
+
+
+@router.message(F.photo)
+async def handle_photo_prompt(message: Message, bot: Bot) -> None:
+    prompt = message.caption
+
+    if not prompt:
+        await message.answer(
+            "Добавьте описание к фотографии в поле подписи, "
+            "например: «Сделай в стиле акварели»."
+        )
+        return
+
+    if message.from_user is None:
+        return
+
+    telegram_id = message.from_user.id
+
+    # Фото должно соблюдать тот же лимит, что и команда /generate.
+    if telegram_id in _active_generations:
+        await message.answer("Предыдущая генерация ещё выполняется. Дождитесь результата.")
+        return
+
+    elapsed = time.monotonic() - _last_generation_at.get(telegram_id, 0.0)
+    if elapsed < GENERATION_COOLDOWN_SECONDS:
+        wait = int(GENERATION_COOLDOWN_SECONDS - elapsed) + 1
+        await message.answer(f"Слишком часто. Подождите {wait} сек.")
+        return
+
+    _active_generations.add(telegram_id)
+    try:
+        photo = message.photo[-1]
+        buffer = BytesIO()
+        try:
+            await bot.download(photo.file_id, destination=buffer)
+        except Exception:
+            logger.exception("Не удалось скачать фотографию пользователя %s", telegram_id)
+            await message.answer("Не удалось скачать фотографию. Попробуйте отправить её ещё раз.")
+            return
+
+        reference_image = buffer.getvalue()
+        if not reference_image:
+            await message.answer("Не удалось скачать фотографию. Попробуйте отправить её ещё раз.")
+            return
+
+        await _run_generation(
+            message,
+            prompt,
+            bot,
+            reference_image=reference_image,
+            media_type="image/jpeg",
+        )
+    finally:
+        _active_generations.discard(telegram_id)
+        _last_generation_at[telegram_id] = time.monotonic()
