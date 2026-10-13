@@ -12,7 +12,6 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 
 import config
-from database import init_db
 from handlers import router, provider
 from balance_watcher import watch_openrouter_balance
 
@@ -20,9 +19,6 @@ from balance_watcher import watch_openrouter_balance
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
-
-    logger.info("Инициализация базы данных...")
-    await init_db()
 
     async with Bot(
         token=config.TELEGRAM_BOT_TOKEN,

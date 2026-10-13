@@ -7,7 +7,6 @@ import config
 
 
 class Base(DeclarativeBase):
-    """Базовый класс для всех таблиц (моделей) SQLAlchemy."""
     pass
 
 
@@ -45,15 +44,3 @@ _async_db_url = config.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg
 
 engine = create_async_engine(_async_db_url, echo=False)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
-
-
-async def init_db() -> None:
-    """
-    Создаёт таблицы в БД, если их ещё нет.
-    Вызывается один раз при старте бота (см. bot.py).
-
-    Для реального продакшена лучше заменить на alembic-миграции,
-    но на старте разработки это самый быстрый способ.
-    """
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
