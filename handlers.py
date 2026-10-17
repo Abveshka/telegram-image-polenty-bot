@@ -3,25 +3,34 @@ from aiogram import Router, F
 from aiogram.types import ErrorEvent, Message
 from aiogram.filters import CommandStart
 from aiogram.types import BufferedInputFile
+import uuid
+from user_service import start_generation, finish_generation
+from admin_alerts import notify_admin_once, resolve_admin_alert
 import time
 import config
+import re
 from user_service import (
     get_or_create_user,
     get_balance,
-    has_enough_balance,
     charge_for_generation,
     credit_balance,
     reserve_payment_refund,
     undo_payment_refund,
-
 )
-from providers.base import ImageGenerationError
 from providers.nano_banana_provider import NanoBananaProvider
 from aiogram.types import LabeledPrice, PreCheckoutQuery
 from aiogram.filters import Command, CommandObject
 from io import BytesIO
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
+from providers.base import (
+    ImageGenerationError,
+    ProviderOutOfFundsError,
+    ProviderTemporaryError,
+)
+
+ALERT_OUT_OF_FUNDS = "openrouter_out_of_funds"
+ALERT_UNAVAILABLE = "openrouter_unavailable"
 
 GENERATION_COOLDOWN_SECONDS = 10
 _active_generations: set[int] = set()
@@ -48,24 +57,31 @@ async def handle_start(message: Message) -> None:
         "Например: «/generate кот-космонавт на скейтборде»"
     )
 
-async def report_failed_generation(
-    bot: Bot, telegram_id: int, username: str | None, prompt: str, error: Exception | str
+def log_failed_generation(
+    gen_id: str, telegram_id: int, username: str | None, prompt: str, error: Exception | str
 ) -> None:
-    """Фиксирует сбой генерации для ручной сверки. Деньги не возвращает."""
+    """Пишет в лог данные для ручной сверки. Деньги не возвращает."""
     logger.error(
-        "СБОЙ ГЕНЕРАЦИИ (звёзды списаны): user=%s, username=%s, prompt=%r, error=%r",
-        telegram_id, username, prompt, error,
+        "СБОЙ ГЕНЕРАЦИИ (попытка списана): gen=%s user=%s username=%s prompt=%r error=%r",
+        gen_id, telegram_id, username, prompt, error,
     )
+
+async def _safe_start_generation(
+    gen_id: str, telegram_id: int, prompt: str, with_photo: bool
+) -> None:
     try:
-        await bot.send_message(
-            config.ADMIN_ID,
-            f"⚠️ Сбой генерации, звёзды списаны\n"
-            f"user: {telegram_id} (@{username})\n"
-            f"промпт: {prompt}\n"
-            f"ошибка: {error!r}",
-        )
+        await start_generation(gen_id, telegram_id, prompt, with_photo)
     except Exception:
-        logger.exception("Не удалось отправить уведомление админу")
+        logger.exception("Не удалось записать старт генерации: gen=%s", gen_id)
+
+
+async def _safe_finish_generation(
+    gen_id: str, status: str, error: Exception | None = None
+) -> None:
+    try:
+        await finish_generation(gen_id, status, error)
+    except Exception:
+        logger.exception("Не удалось записать итог генерации: gen=%s status=%s", gen_id, status)
 
 
 async def _run_generation(
@@ -78,8 +94,10 @@ async def _run_generation(
     if message.from_user is None:
         return
 
+    gen_id = uuid.uuid4().hex[:8]
     telegram_id = message.from_user.id
     username = message.from_user.username
+    with_photo = reference_image is not None
     await get_or_create_user(telegram_id, username)
 
     status_message = await message.answer("Генерирую изображение...")
@@ -94,38 +112,85 @@ async def _run_generation(
         )
         return
 
+    # Звёзды списаны, с этого момента ведём журнал
+    await _safe_start_generation(gen_id, telegram_id, prompt, with_photo)
+    logger.info(
+        "Генерация началась: gen=%s user=%s with_photo=%s prompt=%r",
+        gen_id, telegram_id, with_photo, prompt,
+    )
+
     try:
         image_bytes = await provider.generate(
             prompt,
             reference_image=reference_image,
             media_type=media_type,
         )
-    except ImageGenerationError as error:
-        await report_failed_generation(bot, telegram_id, username, prompt, error)
+    except ProviderOutOfFundsError as error:
+        log_failed_generation(gen_id, telegram_id, username, prompt, error)
+        await _safe_finish_generation(gen_id, "failed", error)
+        await notify_admin_once(
+            bot, ALERT_OUT_OF_FUNDS,
+            "🚨 На OpenRouter кончились средства, генерации не работают!",
+        )
         await status_message.edit_text(
-            "Не получилось сгенерировать изображение. Администратор уведомлён. "
-            "Попробуйте ещё раз или измените запрос."
+            f"Сервис временно недоступен. Администратор уведомлён.\n"
+            f"Код обращения: {gen_id}"
+        )
+        return
+    except ProviderTemporaryError as error:
+        log_failed_generation(gen_id, telegram_id, username, prompt, error)
+        await _safe_finish_generation(gen_id, "failed", error)
+        await notify_admin_once(
+            bot, ALERT_UNAVAILABLE,
+            "⚠️ OpenRouter временно недоступен (429/5xx/сеть).",
+        )
+        await status_message.edit_text(
+            f"Сервис сейчас перегружен. Попробуйте чуть позже.\n"
+            f"Код обращения: {gen_id}"
+        )
+        return
+    except ImageGenerationError as error:
+        log_failed_generation(gen_id, telegram_id, username, prompt, error)
+        await _safe_finish_generation(gen_id, "failed", error)
+        await status_message.edit_text(
+            f"Не получилось сгенерировать изображение. "
+            f"Попробуйте ещё раз или измените запрос.\n"
+            f"Код обращения: {gen_id}"
         )
         return
     except Exception as error:
-        await report_failed_generation(bot, telegram_id, username, prompt, error)
+        logger.exception("Неожиданная ошибка: gen=%s user=%s", gen_id, telegram_id)
+        log_failed_generation(gen_id, telegram_id, username, prompt, error)
+        await _safe_finish_generation(gen_id, "failed", error)
+        await notify_admin_once(
+            bot, "unexpected_generation_error",
+            f"⚠️ Неожиданная ошибка генерации (gen={gen_id}): {error!r}",
+        )
         await status_message.edit_text(
-            "Произошла техническая ошибка при генерации. "
-            "Администратор уведомлён."
+            f"Произошла техническая ошибка при генерации. "
+            f"Администратор уведомлён.\nКод обращения: {gen_id}"
         )
         return
+    else:
+        # Картинка получена, значит и деньги на OpenRouter есть, и сервис жив
+        resolve_admin_alert(ALERT_OUT_OF_FUNDS)
+        resolve_admin_alert(ALERT_UNAVAILABLE)
+        resolve_admin_alert("unexpected_generation_error")
 
     try:
         photo = BufferedInputFile(image_bytes, filename="generated.png")
         await message.answer_photo(photo, caption=f"«{prompt}»")
     except Exception as error:
-        await report_failed_generation(bot, telegram_id, username, prompt, error)
+        log_failed_generation(gen_id, telegram_id, username, prompt, error)
+        await _safe_finish_generation(gen_id, "delivery_failed", error)
         await status_message.edit_text(
-            "Изображение создано, но Telegram не смог его отправить. "
-            "Администратор уведомлён."
+            f"Изображение создано, но Telegram не смог его отправить.\n"
+            f"Код обращения: {gen_id}"
         )
         return
 
+    await _safe_finish_generation(gen_id, "success")
+    logger.info("Генерация завершена: gen=%s user=%s", gen_id, telegram_id)
     await status_message.delete()
 
 @router.message(Command("generate"))
@@ -280,17 +345,21 @@ async def handle_refund(message: Message, command: CommandObject, bot: Bot) -> N
 
 @router.message(Command("compensate"))
 async def handle_compensate(message: Message, command: CommandObject) -> None:
-    """Начисляет звёзды на внутренний баланс юзера в качестве компенсации за сбой по нашей вине."""
+    """Начисляет звёзды в качестве компенсации за сбой по нашей вине."""
     if message.from_user is None or message.from_user.id != config.ADMIN_ID:
         return
 
+    usage = (
+        "Использование: /compensate <telegram_id> <количество> [код_обращения]\n"
+        "Например: /compensate 1498757244 10 a1b2c3d4"
+    )
     if not command.args:
-        await message.answer("Использование: /compensate <telegram_id> <количество>\nНапример: /compensate 1498757244 10")
+        await message.answer(usage)
         return
 
     parts = command.args.split()
-    if len(parts) != 2 or not all(p.lstrip("-").isdigit() for p in parts):
-        await message.answer("Использование: /compensate <telegram_id> <количество>")
+    if len(parts) not in (2, 3) or not all(p.lstrip("-").isdigit() for p in parts[:2]):
+        await message.answer(usage)
         return
 
     target_id, amount = int(parts[0]), int(parts[1])
@@ -298,12 +367,29 @@ async def handle_compensate(message: Message, command: CommandObject) -> None:
         await message.answer("Количество должно быть положительным")
         return
 
-    await credit_balance(
+    gen_id = parts[2].lower() if len(parts) == 3 else None
+    if gen_id is not None and not re.fullmatch(r"[0-9a-f]{8}", gen_id):
+        await message.answer("Код обращения должен состоять из 8 символов (0-9, a-f)")
+        return
+
+    if gen_id is not None:
+        charge_id = f"compensation_{gen_id}"
+    else:
+        # Без кода защиты от повтора нет
+        charge_id = f"compensation_{target_id}_{int(time.time())}"
+
+    credited = await credit_balance(
         telegram_id=target_id,
         username=None,
         stars_amount=amount,
-        charge_id=f"compensation_{target_id}_{int(time.time())}",
+        charge_id=charge_id,
+        tx_type="compensation",
     )
+    if not credited:
+        await message.answer(f"Генерация {gen_id} уже была компенсирована, повторно не начисляю.")
+        return
+
+    logger.info("Компенсация: user=%s amount=%s gen=%s", target_id, amount, gen_id)
 
     balance = await get_balance(target_id)
     await message.answer(f"Начислено {amount} ★ юзеру {target_id} (компенсация).\nЕго баланс теперь: {balance} ★")

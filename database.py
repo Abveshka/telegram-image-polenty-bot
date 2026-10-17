@@ -28,7 +28,7 @@ class Transaction(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     amount: Mapped[int]
-    type: Mapped[str] = mapped_column(String(32))  # "payment" / "generation" / "refund"
+    type: Mapped[str] = mapped_column(String(32))  # "payment" / "generation" / "refund" / "compensation"
     telegram_payment_charge_id: Mapped[str | None] = mapped_column(
         String(128), unique=True, nullable=True, index=True
     )
@@ -37,9 +37,20 @@ class Transaction(Base):
     user: Mapped["User"] = relationship(back_populates="transactions")
 
 
-# SQLAlchemy с asyncpg требует префикс "postgresql+asyncpg://", а не просто
-# "postgresql://" — поэтому подменяем префикс из DATABASE_URL на лету,
-# чтобы в .env оставался стандартный, привычный формат строки подключения.
+class Generation(Base):
+    __tablename__ = "generations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    gen_id: Mapped[str] = mapped_column(String(8), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[str] = mapped_column(String(32))  # started / success / failed / delivery_failed
+    with_photo: Mapped[bool] = mapped_column(default=False)
+    prompt: Mapped[str] = mapped_column(String(2000))
+    error_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_text: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
 _async_db_url = config.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 engine = create_async_engine(_async_db_url, echo=False)

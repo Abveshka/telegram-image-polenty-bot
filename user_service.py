@@ -1,8 +1,8 @@
 import logging
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, update, delete, func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
-from database import async_session, User, Transaction
+from database import async_session, User, Transaction, Generation
 import config
 
 logger = logging.getLogger(__name__)
@@ -85,8 +85,14 @@ async def refund_generation(telegram_id: int) -> None:
         await session.commit()
 
 
-async def credit_balance(telegram_id: int, username: str | None, stars_amount: int, charge_id: str) -> None:
-    """Начисляет кредит ровно один раз для уникального платежа Telegram."""
+async def credit_balance(
+    telegram_id: int,
+    username: str | None,
+    stars_amount: int,
+    charge_id: str,
+    tx_type: str = "payment",
+) -> bool:
+    """Начисляет кредит ровно один раз. Возвращает False, если charge_id уже был."""
     user = await get_or_create_user(telegram_id, username)
 
     async with async_session() as session:
@@ -96,20 +102,20 @@ async def credit_balance(telegram_id: int, username: str | None, stars_amount: i
                     insert(Transaction).values(
                         user_id=user.id,
                         amount=stars_amount,
-                        type="payment",
+                        type=tx_type,
                         telegram_payment_charge_id=charge_id,
                     )
                 )
         except IntegrityError:
-            return
+            return False
 
         await session.execute(
             update(User)
             .where(User.telegram_id == telegram_id)
             .values(balance=User.balance + stars_amount)
         )
-
         await session.commit()
+        return True
 
 async def reserve_payment_refund(charge_id: str) -> tuple[int, int]:
     """
@@ -175,5 +181,29 @@ async def undo_payment_refund(charge_id: str, telegram_id: int, amount: int) -> 
             update(User)
             .where(User.telegram_id == telegram_id)
             .values(balance=User.balance + amount)
+        )
+        await session.commit()
+
+async def start_generation(gen_id: str, telegram_id: int, prompt: str, with_photo: bool) -> None:
+    async with async_session() as session:
+        user_id = await session.scalar(select(User.id).where(User.telegram_id == telegram_id))
+        session.add(Generation(
+            gen_id=gen_id, user_id=user_id, status="started",
+            with_photo=with_photo, prompt=prompt[:2000],
+        ))
+        await session.commit()
+
+
+async def finish_generation(gen_id: str, status: str, error: Exception | None = None) -> None:
+    async with async_session() as session:
+        await session.execute(
+            update(Generation)
+            .where(Generation.gen_id == gen_id)
+            .values(
+                status=status,
+                error_type=type(error).__name__ if error else None,
+                error_text=str(error)[:500] if error else None,
+                finished_at=func.now(),
+            )
         )
         await session.commit()

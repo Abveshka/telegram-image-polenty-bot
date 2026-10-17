@@ -5,19 +5,18 @@ import random
 from typing import Any
 import httpx
 
-from providers.base import ImageGenerationError, ImageProvider
+from providers.base import ImageGenerationError, ImageProvider, ProviderTemporaryError, ProviderOutOfFundsError
 
 logger = logging.getLogger(__name__)
 
 OPENROUTER_IMAGES_URL = "https://openrouter.ai/api/v1/images"
 IMAGE_MODEL = "google/gemini-3.1-flash-image"
 
-MAX_RETRIES = 2
+MAX_RETRIES = 1
 BASE_BACKOFF = 1.5  # секунды
 MAX_CONCURRENT_REQUESTS = 15  # общий лимит одновременных запросов к OpenRouter
 
 class NanoBananaProvider(ImageProvider):
-    """Генерация изображений через Gemini (Nano Banana 2) по API OpenRouter."""
 
     def __init__(self, api_key: str):
         self._api_key = api_key
@@ -80,37 +79,41 @@ class NanoBananaProvider(ImageProvider):
                     },
                     json=payload,
                 )
-
-                if response.status_code == 402:
-                    # Кончились деньги на счету OpenRouter — ретраить бессмысленно
-                    raise ImageGenerationError(
-                        f"Недостаточно средств на счету OpenRouter: {response.text[:300]}"
+            except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+                # Запрос не дошёл до сервера, повтор безопасен
+                last_error = ProviderTemporaryError(f"Не удалось подключиться: {error}")
+            except httpx.TimeoutException as error:
+                # Ждали ответ и не дождались: сервер мог начать генерацию, не повторяем
+                raise ImageGenerationError("OpenRouter не ответил вовремя") from error
+            except httpx.TransportError as error:
+                last_error = ProviderTemporaryError(f"Сетевая ошибка: {error}")
+            else:
+                status = response.status_code
+                if status == 402:
+                    raise ProviderOutOfFundsError(
+                        f"Недостаточно средств на OpenRouter: {response.text[:300]}"
                     )
-
-                if response.status_code == 429 or response.status_code >= 500:
-                    # Временная перегрузка — можно повторить попытку
-                    raise ImageGenerationError(
-                        f"OpenRouter временно недоступен ({response.status_code}): "
-                        f"{response.text[:300]}"
+                if status == 429 or status >= 500:
+                    last_error = ProviderTemporaryError(
+                        f"OpenRouter временно недоступен ({status}): {response.text[:300]}"
                     )
-
-                response.raise_for_status()
-                data = response.json()
-                image_b64 = data["data"][0]["b64_json"]
-                return base64.b64decode(image_b64)
-
-            except (httpx.TimeoutException, httpx.TransportError, ImageGenerationError) as error:
-                if "Недостаточно средств" in str(error):
-                    raise  # это не временная проблема, ретрай не поможет
-                last_error = error
-            except (KeyError, IndexError, ValueError) as error:
-                # Неожиданный формат ответа — ретраить бесполезно
-                raise ImageGenerationError(f"Некорректный ответ OpenRouter: {error}") from error
+                elif status >= 400:
+                    raise ImageGenerationError(
+                        f"OpenRouter вернул {status}: {response.text[:300]}"
+                    )
+                else:
+                    try:
+                        data = response.json()
+                        return base64.b64decode(data["data"][0]["b64_json"])
+                    except (KeyError, IndexError, TypeError, ValueError) as error:
+                        raise ImageGenerationError(
+                            f"Некорректный ответ OpenRouter: {error}"
+                        ) from error
 
             if attempt < MAX_RETRIES:
                 delay = BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 0.5)
                 logger.warning(
-                    "Retry %s/%s генерации после ошибки: %s", attempt + 1, MAX_RETRIES, last_error
+                    "Retry %s/%s после ошибки: %s", attempt + 1, MAX_RETRIES, last_error
                 )
                 await asyncio.sleep(delay)
 

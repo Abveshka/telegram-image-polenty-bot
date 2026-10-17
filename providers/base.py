@@ -1,7 +1,13 @@
 from abc import ABC, abstractmethod
 
 class ImageGenerationError(Exception):
-    pass
+    """Любая ошибка генерации."""
+
+class ProviderOutOfFundsError(ImageGenerationError):
+    """На счёте провайдера кончились деньги (HTTP 402)."""
+
+class ProviderTemporaryError(ImageGenerationError):
+    """Временный сбой (429, 5xx, обрыв соединения), повтор имеет смысл."""
 
 class ImageProvider(ABC):
     @abstractmethod
