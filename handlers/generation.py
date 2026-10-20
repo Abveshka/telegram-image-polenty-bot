@@ -1,6 +1,7 @@
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from io import BytesIO
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
@@ -9,12 +10,11 @@ import config
 from admin_alerts import notify_admin_once, resolve_admin_alert
 from handlers.keyboards import main_menu_keyboard
 from providers.base import (
-    ImageGenerationError, ProviderOutOfFundsError, ProviderTemporaryError,
+    ImageGenerationError, ProviderOutOfFundsError, ProviderTemporaryError, ImageRejectedError,
 )
 from providers.nano_banana_provider import NanoBananaProvider
 from user_service import (
-    charge_for_generation, finish_generation, get_balance,
-    get_or_create_user, start_generation,
+    finish_generation, get_balance, get_or_create_user, begin_generation, get_block_remaining, compensate_generation,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -50,14 +50,6 @@ def log_failed_generation(
         gen_id, telegram_id, username, prompt, error,
     )
 
-async def _safe_start_generation(
-    gen_id: str, telegram_id: int, prompt: str, with_photo: bool
-) -> None:
-    try:
-        await start_generation(gen_id, telegram_id, prompt, with_photo)
-    except Exception:
-        logger.exception("Не удалось записать старт генерации: gen=%s", gen_id)
-
 
 async def _safe_finish_generation(
     gen_id: str, status: str, error: Exception | None = None
@@ -67,6 +59,22 @@ async def _safe_finish_generation(
     except Exception:
         logger.exception("Не удалось записать итог генерации: gen=%s status=%s", gen_id, status)
 
+
+
+async def _safe_compensate(
+    gen_id: str, status: str, error: Exception, count_as_reject: bool = False
+) -> tuple[bool, datetime | None]:
+    """Возвращает (удалось ли вернуть токены, blocked_until)."""
+    try:
+        return True, await compensate_generation(gen_id, status, error, count_as_reject)
+    except Exception:
+        logger.exception("Не удалось вернуть токены: gen=%s", gen_id)
+        return False, None
+
+
+def _format_wait(until: datetime) -> str:
+    minutes = max(1, int((until - datetime.now(timezone.utc)).total_seconds() // 60) + 1)
+    return f"{minutes} мин." if minutes < 60 else f"{(minutes + 59) // 60} ч."
 
 async def _run_generation(
     message: Message,
@@ -90,7 +98,16 @@ async def _run_generation(
 
     status_message = await message.answer("Генерирую изображение...")
 
-    if not await charge_for_generation(telegram_id):
+    try:
+        charged = await begin_generation(gen_id, telegram_id, prompt, with_photo)
+    except Exception:
+        logger.exception("Не удалось начать генерацию: gen=%s user=%s", gen_id, telegram_id)
+        await status_message.edit_text(
+            "Техническая ошибка, токены не списаны. Попробуйте ещё раз."
+        )
+        return
+
+    if not charged:
         balance = await get_balance(telegram_id)
         await status_message.edit_text(
             f"Недостаточно токенов для генерации.\n"
@@ -100,8 +117,6 @@ async def _run_generation(
         )
         return
 
-    # Звёзды списаны, с этого момента ведём журнал
-    await _safe_start_generation(gen_id, telegram_id, prompt, with_photo)
     logger.info(
         "Генерация началась: gen=%s user=%s with_photo=%s prompt=%r",
         gen_id, telegram_id, with_photo, prompt,
@@ -113,31 +128,65 @@ async def _run_generation(
             reference_image=reference_image,
             media_type=media_type,
         )
+    except ImageRejectedError as error:
+        logger.warning(
+            "Отказ модерации: gen=%s user=%s username=%s prompt=%r error=%r",
+            gen_id, telegram_id, username, prompt, error,
+        )
+        ok, blocked_until = await _safe_compensate(
+            gen_id, "rejected", error, count_as_reject=True
+        )
+        # Google ответил, значит OpenRouter жив и деньги на нём есть
+        resolve_admin_alert(ALERT_OUT_OF_FUNDS)
+        resolve_admin_alert(ALERT_UNAVAILABLE)
+
+        text = (
+            "Запрос отклонён модерацией, изображение не создано. "
+            "Попробуйте изменить описание.\n"
+            + ("Токен возвращён.\n" if ok else "Автовозврат не удался.\n")
+            + f"Код обращения: {gen_id}"
+        )
+        if blocked_until is not None:
+            text += (
+                "\n\nИз-за нескольких отклонённых запросов подряд генерация "
+                f"приостановлена на {_format_wait(blocked_until)}"
+            )
+        await status_message.edit_text(text)
+        return
     except ProviderOutOfFundsError as error:
-        log_failed_generation(gen_id, telegram_id, username, prompt, error)
-        await _safe_finish_generation(gen_id, "failed", error)
+        logger.error(
+            "Сбой OpenRouter, нет доступа или средств: gen=%s user=%s error=%r",
+            gen_id, telegram_id, error,
+        )
+        ok, _ = await _safe_compensate(gen_id, "unavailable", error)
         await notify_admin_once(
             bot, ALERT_OUT_OF_FUNDS,
-            "🚨 На OpenRouter кончились средства, генерации не работают!",
+            f"🚨 OpenRouter: нет средств или доступа, генерации не работают!\n{str(error)[:300]}",
         )
         await status_message.edit_text(
-            f"Сервис временно недоступен. Администратор уведомлён.\n"
-            f"Код обращения: {gen_id}"
+            "Сервис временно недоступен. Администратор уведомлён.\n"
+            + ("Токен возвращён.\n" if ok else "Автовозврат не удался, администратор разберётся.\n")
+            + f"Код обращения: {gen_id}"
         )
         return
     except ProviderTemporaryError as error:
-        log_failed_generation(gen_id, telegram_id, username, prompt, error)
-        await _safe_finish_generation(gen_id, "failed", error)
+        logger.warning(
+            "OpenRouter временно недоступен: gen=%s user=%s error=%r",
+            gen_id, telegram_id, error,
+        )
+        ok, _ = await _safe_compensate(gen_id, "unavailable", error)
         await notify_admin_once(
             bot, ALERT_UNAVAILABLE,
-            "⚠️ OpenRouter временно недоступен (429/5xx/сеть).",
+            f"⚠️ OpenRouter временно недоступен (429/5xx/сеть).\n{str(error)[:300]}",
         )
         await status_message.edit_text(
-            f"Сервис сейчас перегружен. Попробуйте чуть позже.\n"
-            f"Код обращения: {gen_id}"
+            "Сервис сейчас перегружен. Попробуйте чуть позже.\n"
+            + ("Токен возвращён.\n" if ok else "Автовозврат не удался, администратор разберётся.\n")
+            + f"Код обращения: {gen_id}"
         )
         return
     except ImageGenerationError as error:
+        # Без возврата: сверяешь вручную по gen_id
         log_failed_generation(gen_id, telegram_id, username, prompt, error)
         await _safe_finish_generation(gen_id, "failed", error)
         await status_message.edit_text(
@@ -188,6 +237,15 @@ async def run_guarded(
     if message.from_user is None:
         return
     user_id = message.from_user.id
+
+    remaining = await get_block_remaining(user_id)
+    if remaining is not None:
+        minutes = int(remaining.total_seconds() // 60) + 1
+        await message.answer(
+            f"Генерация временно недоступна из-за нескольких отклонённых запросов подряд. "
+            f"Попробуйте через {minutes} мин."
+        )
+        return
 
     refusal = check_limits(user_id)
     if refusal:

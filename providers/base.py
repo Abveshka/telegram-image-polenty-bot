@@ -9,6 +9,9 @@ class ProviderOutOfFundsError(ImageGenerationError):
 class ProviderTemporaryError(ImageGenerationError):
     """Временный сбой (429, 5xx, обрыв соединения), повтор имеет смысл."""
 
+class ImageRejectedError(ImageGenerationError):
+    """Модель или модерация отказались генерировать. Картинки нет."""
+
 class ImageProvider(ABC):
     @abstractmethod
     async def generate(

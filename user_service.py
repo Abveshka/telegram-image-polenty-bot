@@ -1,6 +1,7 @@
 import logging
-from sqlalchemy import select, update, delete, func
-from sqlalchemy.dialects.postgresql import insert
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import insert, select, update, delete, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from database import async_session, User, Transaction, Generation
 import config
@@ -10,7 +11,7 @@ logger = logging.getLogger(__name__)
 async def get_or_create_user(telegram_id: int, username: str | None) -> User:
     async with async_session() as session:
         created = await session.scalar(
-            insert(User)
+            pg_insert(User)
             .values(telegram_id=telegram_id, username=username, balance=0)
             .on_conflict_do_nothing(index_elements=[User.telegram_id])
             .returning(User)
@@ -45,45 +46,67 @@ async def has_enough_balance(telegram_id: int) -> bool:
     return balance >= config.PRICE_PER_GENERATION_STARS
 
 
-async def charge_for_generation(telegram_id: int) -> bool:
-    price = config.PRICE_PER_GENERATION_STARS
+async def compensate_generation(
+    gen_id: str, status: str, error: Exception, count_as_reject: bool = False
+) -> datetime | None:
+    """Идемпотентно возвращает токены за генерацию и закрывает её.
+    Возвращает новый rejected_streak (если count_as_reject), иначе None.
+    Повторный вызов или генерация уже закрыта -> ничего не делает, вернёт None.
+    """
     async with async_session() as session:
-        result = await session.execute(
-            update(User)
-            .where(User.telegram_id == telegram_id, User.balance >= price)
-            .values(balance=User.balance - price)
-            .returning(User.id)
-        )
-        row = result.first()
-        if row is None:
-            return False
+        async with session.begin():
+            # 1. Условный переход started -> status: выигрывает ровно один вызов
+            row = (await session.execute(
+                update(Generation)
+                .where(Generation.gen_id == gen_id, Generation.status == "started")
+                .values(
+                    status=status,
+                    error_type=type(error).__name__,
+                    error_text=str(error)[:500],
+                    finished_at=func.now(),
+                )
+                .returning(Generation.id, Generation.user_id)
+            )).first()
+            if row is None:
+                return None  # уже финализирована
+            generation_pk, user_id = row
 
-        await session.execute(
-            insert(Transaction).values(user_id=row[0], amount=-price, type="generation")
-        )
-        await session.commit()
-        return True
+            # 2. Сколько списали за эту генерацию
+            charged = await session.scalar(
+                select(Transaction.amount).where(
+                    Transaction.generation_id == generation_pk,
+                    Transaction.type == "generation",
+                )
+            )
+            if charged is None:
+                logger.error("Нет транзакции списания: gen=%s", gen_id)
+                return None
+            amount = -charged
 
-async def refund_generation(telegram_id: int) -> None:
-    """Возвращает один заранее списанный кредит после ошибки генерации."""
-    price = config.PRICE_PER_GENERATION_STARS
-    async with async_session() as session:
-        result = await session.execute(
-            update(User)
-            .where(User.telegram_id == telegram_id)
-            .values(balance=User.balance + price)
-            .returning(User.id)
-        )
-        row = result.first()
-        if row is None:
-            logger.error(f"refund_generation: пользователь {telegram_id} не найден")
-            return
+            # 3. Транзакция компенсации; конфликт по charge_id = уже компенсировано
+            inserted = await session.scalar(
+                pg_insert(Transaction)
+                .values(
+                    user_id=user_id,
+                    amount=amount,
+                    type="compensation",
+                    generation_id=generation_pk,
+                    telegram_payment_charge_id=f"compensation_{gen_id}",
+                )
+                .on_conflict_do_nothing()
+                .returning(Transaction.id)
+            )
+            if inserted is not None:
+                await session.execute(
+                    update(User)
+                    .where(User.id == user_id)
+                    .values(balance=User.balance + amount)
+                )
 
-        await session.execute(
-            insert(Transaction).values(user_id=row[0], amount=price, type="refund")
-        )
-        await session.commit()
-
+            # 4. Серия отказов модерации
+            if count_as_reject:
+                return await _register_reject(session, user_id)
+    return None
 
 async def credit_balance(
     telegram_id: int,
@@ -184,26 +207,101 @@ async def undo_payment_refund(charge_id: str, telegram_id: int, amount: int) -> 
         )
         await session.commit()
 
-async def start_generation(gen_id: str, telegram_id: int, prompt: str, with_photo: bool) -> None:
+async def begin_generation(
+    gen_id: str, telegram_id: int, prompt: str, with_photo: bool
+) -> bool:
+    """Атомарно: списание + запись Generation + Transaction.
+    Возвращает False, если не хватает токенов (ничего не изменено)."""
+    price = config.PRICE_PER_GENERATION_STARS
     async with async_session() as session:
-        user_id = await session.scalar(select(User.id).where(User.telegram_id == telegram_id))
-        session.add(Generation(
-            gen_id=gen_id, user_id=user_id, status="started",
-            with_photo=with_photo, prompt=prompt[:2000],
-        ))
-        await session.commit()
+        async with session.begin():
+            user_id = await session.scalar(
+                update(User)
+                .where(User.telegram_id == telegram_id, User.balance >= price)
+                .values(balance=User.balance - price)
+                .returning(User.id)
+            )
+            if user_id is None:
+                return False
 
+            generation_pk = await session.scalar(
+                insert(Generation)
+                .values(
+                    gen_id=gen_id,
+                    user_id=user_id,
+                    status="started",
+                    with_photo=with_photo,
+                    prompt=prompt[:2000],
+                )
+                .returning(Generation.id)
+            )
+
+            await session.execute(
+                insert(Transaction).values(
+                    user_id=user_id,
+                    amount=-price,
+                    type="generation",
+                    generation_id=generation_pk,
+                )
+            )
+        return True
+
+
+BAN_THRESHOLD = 3
+BAN_LADDER = [timedelta(minutes=10), timedelta(hours=1), timedelta(hours=24)]
+BLOCK_COUNT_RESET = timedelta(days=7)
+
+
+async def _register_reject(session, user_id: int) -> datetime | None:
+    """Увеличивает серию отказов; при пороге ставит бан. Возвращает blocked_until или None."""
+    streak, block_count, blocked_until = (await session.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(rejected_streak=User.rejected_streak + 1)
+        .returning(User.rejected_streak, User.block_count, User.blocked_until)
+    )).one()
+
+    if streak < BAN_THRESHOLD:
+        return None
+
+    now = datetime.now(timezone.utc)
+    # Эскалация обнуляется, если с конца прошлого бана прошло 7+ дней
+    if blocked_until is not None and now - blocked_until > BLOCK_COUNT_RESET:
+        block_count = 0
+
+    until = now + BAN_LADDER[min(block_count, len(BAN_LADDER) - 1)]
+    await session.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(rejected_streak=0, block_count=block_count + 1, blocked_until=until)
+    )
+    return until
 
 async def finish_generation(gen_id: str, status: str, error: Exception | None = None) -> None:
     async with async_session() as session:
-        await session.execute(
-            update(Generation)
-            .where(Generation.gen_id == gen_id)
-            .values(
-                status=status,
-                error_type=type(error).__name__ if error else None,
-                error_text=str(error)[:500] if error else None,
-                finished_at=func.now(),
-            )
+        async with session.begin():
+            row = (await session.execute(
+                update(Generation)
+                .where(Generation.gen_id == gen_id, Generation.status == "started")
+                .values(
+                    status=status,
+                    error_type=type(error).__name__ if error else None,
+                    error_text=str(error)[:500] if error else None,
+                    finished_at=func.now(),
+                )
+                .returning(Generation.user_id)
+            )).first()
+            if row is not None and status == "success":
+                await session.execute(
+                    update(User).where(User.id == row[0]).values(rejected_streak=0)
+                )
+
+async def get_block_remaining(telegram_id: int) -> timedelta | None:
+    async with async_session() as session:
+        until = await session.scalar(
+            select(User.blocked_until).where(User.telegram_id == telegram_id)
         )
-        await session.commit()
+    if until is None:
+        return None
+    remaining = until - datetime.now(timezone.utc)
+    return remaining if remaining.total_seconds() > 0 else None

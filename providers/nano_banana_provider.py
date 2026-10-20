@@ -5,7 +5,8 @@ import random
 from typing import Any
 import httpx
 
-from providers.base import ImageGenerationError, ImageProvider, ProviderTemporaryError, ProviderOutOfFundsError
+from providers.base import ImageGenerationError, ImageProvider, ProviderTemporaryError, ProviderOutOfFundsError, \
+    ImageRejectedError
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,24 @@ IMAGE_MODEL = "google/gemini-3.1-flash-image"
 MAX_RETRIES = 1
 BASE_BACKOFF = 1.5  # секунды
 MAX_CONCURRENT_REQUESTS = 15  # общий лимит одновременных запросов к OpenRouter
+
+def _error_info(response: httpx.Response) -> tuple[dict, dict]:
+    """Достаёт error и error.metadata из тела ответа. Не падает на мусоре."""
+    try:
+        body = response.json()
+    except ValueError:
+        return {}, {}
+    err = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(err, dict):
+        return {}, {}
+    meta = err.get("metadata")
+    return err, meta if isinstance(meta, dict) else {}
+
+
+def _is_rejection(status: int, meta: dict) -> bool:
+    if meta.get("error_type") in ("content_policy_violation", "refusal"):
+        return True
+    return status == 400 and bool(meta.get("finish_reason") or meta.get("block_reason"))
 
 class NanoBananaProvider(ImageProvider):
 
@@ -89,26 +108,43 @@ class NanoBananaProvider(ImageProvider):
                 last_error = ProviderTemporaryError(f"Сетевая ошибка: {error}")
             else:
                 status = response.status_code
-                if status == 402:
-                    raise ProviderOutOfFundsError(
-                        f"Недостаточно средств на OpenRouter: {response.text[:300]}"
-                    )
-                if status == 429 or status >= 500:
-                    last_error = ProviderTemporaryError(
-                        f"OpenRouter временно недоступен ({status}): {response.text[:300]}"
-                    )
-                elif status >= 400:
-                    raise ImageGenerationError(
-                        f"OpenRouter вернул {status}: {response.text[:300]}"
-                    )
-                else:
-                    try:
-                        data = response.json()
-                        return base64.b64decode(data["data"][0]["b64_json"])
-                    except (KeyError, IndexError, TypeError, ValueError) as error:
+
+            if status < 400:
+                try:
+                    data = response.json()
+                    if isinstance(data, dict) and data.get("error"):
                         raise ImageGenerationError(
-                            f"Некорректный ответ OpenRouter: {error}"
-                        ) from error
+                            f"OpenRouter вернул {status} с ошибкой: {response.text[:300]}"
+                        )
+                    return base64.b64decode(data["data"][0]["b64_json"])
+                except ImageGenerationError:
+                    raise
+                except (KeyError, IndexError, TypeError, ValueError) as error:
+                    raise ImageGenerationError(
+                        f"Некорректный ответ OpenRouter ({status}): "
+                        f"{error!r}; тело: {response.text[:300]}"
+                    ) from error
+
+            err, meta = _error_info(response)
+
+            if _is_rejection(status, meta):
+                reason = meta.get("finish_reason") or meta.get("block_reason") or meta.get("error_type")
+                raise ImageRejectedError(
+                    f"OpenRouter отклонил запрос ({status}, {reason}): "
+                    f"{str(err.get('message', ''))[:200]}"
+                )
+            if status in (401, 402) or (status == 403 and meta.get("limit_source")):
+                raise ProviderOutOfFundsError(
+                    f"Нет доступа или средств на OpenRouter ({status}): {response.text[:300]}"
+                )
+            if status == 429 or status >= 500:
+                last_error = ProviderTemporaryError(
+                    f"OpenRouter временно недоступен ({status}): {response.text[:300]}"
+                )
+            else:
+                raise ImageGenerationError(
+                    f"OpenRouter вернул {status}: {response.text[:300]}"
+                )
 
             if attempt < MAX_RETRIES:
                 delay = BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 0.5)
