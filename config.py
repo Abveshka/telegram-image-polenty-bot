@@ -23,6 +23,10 @@ IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1K")
 ASPECT_RATIO = os.getenv("ASPECT_RATIO", "1:1")
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
+YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN", "")  # тестовый токен из BotFather
+# Код НДС для чека: 1 = без НДС.
+YOOKASSA_VAT_CODE = 1
+
 # Например: http://127.0.0.1:10809. Нужен, когда VPN работает в
 # proxy-режиме, а не в TUN-режиме: aiohttp не использует системный прокси
 # Windows автоматически.
@@ -32,8 +36,9 @@ OPENROUTER_MANAGEMENT_KEY = os.environ["OPENROUTER_MANAGEMENT_KEY"]
 
 PRICE_PER_GENERATION_STARS = 10
 STAR_PACKAGES = [
-    #{"label": "TEST 1 ★ → 1 генерация", "stars_to_pay": 1, "credit_stars": 10}, тест
-    {"label": "100 ★ → 10 генераций", "stars_to_pay": 100, "credit_stars": 100},
-    {"label": "500 ★ → 55 генераций (+5 бонус)", "stars_to_pay": 500, "credit_stars": 550},
-    {"label": "1000 ★ → 120 генераций (+20 бонус)", "stars_to_pay": 1000, "credit_stars": 1200},
+    {"label": "TEST 1 ★ → 1 генерация", "credit_stars": 10, "stars_to_pay": 1, "rub_to_pay": 1},
+    {"label": "+4 Генерации | 119 руб/звезд", "credit_stars": 40, "stars_to_pay": 119, "rub_to_pay": 119},
+    {"label": "+10 Генерации | 279 руб/звезд", "credit_stars": 100, "stars_to_pay": 279, "rub_to_pay": 279},
+    {"label": "+25 Генерации | 649 руб/звезд", "credit_stars": 250, "stars_to_pay": 649, "rub_to_pay": 649},
+    {"label": "+40 Генерации | 999 руб/звезд", "credit_stars": 400, "stars_to_pay": 999, "rub_to_pay": 999},
 ]

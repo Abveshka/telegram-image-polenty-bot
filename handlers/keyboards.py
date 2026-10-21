@@ -12,6 +12,16 @@ def buy_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def payment_method_keyboard(credit: int, rub_price: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Оплатить {rub_price} RUB 🇷🇺", callback_data=f"buy:rub:{credit}")],
+            [InlineKeyboardButton(text="🌟 Telegram Stars", callback_data=f"buy:stars:{credit}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="buy:tokens")],
+        ]
+    )
+
+
 def packages_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
