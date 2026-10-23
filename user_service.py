@@ -1,9 +1,9 @@
 import logging
-from datetime import datetime, timedelta, timezone
-from sqlalchemy import insert, select, update, delete, func
+from datetime import date, datetime, timedelta, timezone
+from sqlalchemy import insert, select, update, delete, func, case, or_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
-from database import async_session, User, Transaction, Generation
+from database import async_session, User, Transaction, Generation, Subscription
 import config
 
 logger = logging.getLogger(__name__)
@@ -41,21 +41,72 @@ async def get_balance(telegram_id: int) -> int:
         return balance
 
 
+def _today_msk() -> date:
+    return datetime.now(config.SUBSCRIPTION_TZ).date()
+
+
+async def _try_spend_daily(session, user_id: int, today: date, now: datetime) -> bool:
+    """Пытается списать одну дневную генерацию подписки. Одним атомарным UPDATE.
+    True: списали. False: подписки нет, она истекла или лимит на сегодня выбран."""
+    spent = await session.scalar(
+        update(Subscription)
+        .where(
+            Subscription.user_id == user_id,
+            Subscription.expires_at > now,
+            or_(
+                Subscription.daily_date.is_distinct_from(today),
+                Subscription.daily_used < Subscription.daily_limit,
+            ),
+        )
+        .values(
+            daily_used=case(
+                (Subscription.daily_date == today, Subscription.daily_used + 1),
+                else_=1,  # новый день: начинаем с 1
+            ),
+            daily_date=today,
+        )
+        .returning(Subscription.id)
+    )
+    return spent is not None
+
+
+async def _daily_left(session, user_id: int) -> int:
+    """Сколько дневных генераций осталось сегодня (0, если подписки нет или она истекла)."""
+    row = (await session.execute(
+        select(Subscription.daily_limit, Subscription.daily_used, Subscription.daily_date)
+        .where(
+            Subscription.user_id == user_id,
+            Subscription.expires_at > datetime.now(timezone.utc),
+        )
+    )).first()
+    if row is None:
+        return 0
+    limit, used, day = row
+    return limit if day != _today_msk() else max(limit - used, 0)
+
 async def has_enough_balance(telegram_id: int) -> bool:
-    balance = await get_balance(telegram_id)
-    return balance >= config.PRICE_PER_GENERATION_STARS
+    price = config.PRICE_PER_GENERATION_STARS
+    async with async_session() as session:
+        row = (await session.execute(
+            select(User.id, User.balance).where(User.telegram_id == telegram_id)
+        )).first()
+        if row is None:
+            raise RuntimeError(
+                f"has_enough_balance: пользователь {telegram_id} не найден — "
+                f"вызовите get_or_create_user перед проверкой"
+            )
+        user_id, balance = row
+        if balance >= price:
+            return True
+        return await _daily_left(session, user_id) > 0
 
 
 async def compensate_generation(
     gen_id: str, status: str, error: Exception, count_as_reject: bool = False
 ) -> datetime | None:
-    """Идемпотентно возвращает токены за генерацию и закрывает её.
-    Возвращает новый rejected_streak (если count_as_reject), иначе None.
-    Повторный вызов или генерация уже закрыта -> ничего не делает, вернёт None.
-    """
+    """Идемпотентно возвращает генерацию (в дневной лимит или токенами) и закрывает её"""
     async with async_session() as session:
         async with session.begin():
-            # 1. Условный переход started -> status: выигрывает ровно один вызов
             row = (await session.execute(
                 update(Generation)
                 .where(Generation.gen_id == gen_id, Generation.status == "started")
@@ -65,13 +116,15 @@ async def compensate_generation(
                     error_text=str(error)[:500],
                     finished_at=func.now(),
                 )
-                .returning(Generation.id, Generation.user_id)
+                .returning(
+                    Generation.id, Generation.user_id, Generation.source, Generation.sub_day
+                )
             )).first()
             if row is None:
-                return None  # уже финализирована
-            generation_pk, user_id = row
+                return None
+            generation_pk, user_id, source, sub_day = row
 
-            # 2. Сколько списали за эту генерацию
+            # Сколько списали за эту генерацию (для подписочной это 0)
             charged = await session.scalar(
                 select(Transaction.amount).where(
                     Transaction.generation_id == generation_pk,
@@ -81,9 +134,28 @@ async def compensate_generation(
             if charged is None:
                 logger.error("Нет транзакции списания: gen=%s", gen_id)
                 return None
-            amount = -charged
 
-            # 3. Транзакция компенсации; конфликт по charge_id = уже компенсировано
+            if source == "sub":
+                # Возвращаем в дневной лимит, но только если счётчик всё ещё относится
+                restored = await session.scalar(
+                    update(Subscription)
+                    .where(
+                        Subscription.user_id == user_id,
+                        Subscription.daily_date == sub_day,
+                        Subscription.daily_used > 0,
+                    )
+                    .values(daily_used=Subscription.daily_used - 1)
+                    .returning(Subscription.id)
+                )
+                if restored is not None:
+                    amount, comp_source = 0, "sub"
+                else:
+                    # День сменился (лимит уже сгорел): компенсируем токенами
+                    amount, comp_source = config.PRICE_PER_GENERATION_STARS, "balance"
+            else:
+                amount, comp_source = -charged, "balance"
+
+            # Транзакция компенсации; конфликт по charge_id = уже компенсировано
             inserted = await session.scalar(
                 pg_insert(Transaction)
                 .values(
@@ -92,18 +164,19 @@ async def compensate_generation(
                     type="compensation",
                     generation_id=generation_pk,
                     telegram_payment_charge_id=f"compensation_{gen_id}",
+                    source=comp_source,
                 )
                 .on_conflict_do_nothing()
                 .returning(Transaction.id)
             )
-            if inserted is not None:
+            if inserted is not None and amount:
                 await session.execute(
                     update(User)
                     .where(User.id == user_id)
                     .values(balance=User.balance + amount)
                 )
 
-            # 4. Серия отказов модерации
+            # Серия отказов модерации
             if count_as_reject:
                 return await _register_reject(session, user_id)
     return None
@@ -210,19 +283,31 @@ async def undo_payment_refund(charge_id: str, telegram_id: int, amount: int) -> 
 async def begin_generation(
     gen_id: str, telegram_id: int, prompt: str, with_photo: bool
 ) -> bool:
-    """Атомарно: списание + запись Generation + Transaction.
-    Возвращает False, если не хватает токенов (ничего не изменено)."""
+    """Атомарно: списание + запись Generation + Transaction."""
     price = config.PRICE_PER_GENERATION_STARS
+    now = datetime.now(timezone.utc)
+    today = _today_msk()
+
     async with async_session() as session:
         async with session.begin():
             user_id = await session.scalar(
-                update(User)
-                .where(User.telegram_id == telegram_id, User.balance >= price)
-                .values(balance=User.balance - price)
-                .returning(User.id)
+                select(User.id).where(User.telegram_id == telegram_id)
             )
             if user_id is None:
                 return False
+
+            if await _try_spend_daily(session, user_id, today, now):
+                source, sub_day, charged = "sub", today, 0
+            else:
+                paid_user = await session.scalar(
+                    update(User)
+                    .where(User.id == user_id, User.balance >= price)
+                    .values(balance=User.balance - price)
+                    .returning(User.id)
+                )
+                if paid_user is None:
+                    return False
+                source, sub_day, charged = "balance", None, price
 
             generation_pk = await session.scalar(
                 insert(Generation)
@@ -232,6 +317,8 @@ async def begin_generation(
                     status="started",
                     with_photo=with_photo,
                     prompt=prompt[:2000],
+                    source=source,
+                    sub_day=sub_day,
                 )
                 .returning(Generation.id)
             )
@@ -239,9 +326,10 @@ async def begin_generation(
             await session.execute(
                 insert(Transaction).values(
                     user_id=user_id,
-                    amount=-price,
+                    amount=-charged,  # для подписочной генерации 0
                     type="generation",
                     generation_id=generation_pk,
+                    source=source,
                 )
             )
         return True

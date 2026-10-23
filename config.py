@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-
+from zoneinfo import ZoneInfo
 load_dotenv()
 
 
@@ -13,6 +13,40 @@ def _get_required(key: str) -> str:
         )
     return value
 
+SUBSCRIPTION_TZ = ZoneInfo("Europe/Moscow")
+
+SUBSCRIPTION_TIERS = {
+    "basic": {
+        "title": "Basic",
+        "emoji": "🔹",
+        "daily_limit": 3,
+        "prices": {7: 179, 30: 390, 90: 990},
+    },
+    "pro": {
+        "title": "Pro",
+        "emoji": "⚡",
+        "daily_limit": 7,
+        "prices": {7: 279, 30: 590, 90: 1490},
+    },
+}
+
+PERIOD_LABELS = {7: "7 дней", 30: "1 месяц", 90: "3 месяца"}
+
+def get_subscription_price(tier: str, period_days: int) -> int | None:
+    """Цена в рублях или None, если такого тарифа/периода нет."""
+    tier_cfg = SUBSCRIPTION_TIERS.get(tier)
+    if tier_cfg is None:
+        return None
+    return tier_cfg["prices"].get(period_days)
+
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
+
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")
+YOOKASSA_RETURN_URL = f"https://t.me/{BOT_USERNAME}"
+
+RENEWAL_RETRY_INTERVAL_HOURS = 24
+RENEWAL_MAX_ATTEMPTS = 3
 
 TELEGRAM_BOT_TOKEN = _get_required("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = _get_required("GEMINI_API_KEY")
@@ -23,9 +57,11 @@ IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1K")
 ASPECT_RATIO = os.getenv("ASPECT_RATIO", "1:1")
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
-YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN", "")  # тестовый токен из BotFather
-# Код НДС для чека: 1 = без НДС.
-YOOKASSA_VAT_CODE = 1
+# Только для разработки: подменяет вызов провайдера картинок, деньги OpenRouter не тратятся.
+# "off"  - обычная работа
+# "ok"   - притворяемся, что генерация прошла успешно
+# "fail" - притворяемся, что провайдер временно недоступен (проверка возврата)
+DEV_FAKE_GENERATION = os.getenv("DEV_FAKE_GENERATION", "off")
 
 # Например: http://127.0.0.1:10809. Нужен, когда VPN работает в
 # proxy-режиме, а не в TUN-режиме: aiohttp не использует системный прокси

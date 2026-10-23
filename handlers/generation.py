@@ -1,6 +1,7 @@
 import logging
 import time
 import uuid
+from pathlib import Path
 from datetime import datetime, timezone
 from io import BytesIO
 from aiogram import Bot, F, Router
@@ -24,6 +25,9 @@ logger = logging.getLogger(__name__)
 router = Router(name="generation")
 
 provider = NanoBananaProvider(api_key=config.OPENROUTER_API_KEY)
+
+# Любая небольшая настоящая картинка для тестов. Положи рядом с ботом файл test.png
+_FAKE_IMAGE = Path("test.jpg").read_bytes() if config.DEV_FAKE_GENERATION == "ok" else b""
 
 ALERT_OUT_OF_FUNDS = "openrouter_out_of_funds"
 ALERT_UNAVAILABLE = "openrouter_unavailable"
@@ -123,11 +127,16 @@ async def _run_generation(
     )
 
     try:
-        image_bytes = await provider.generate(
-            prompt,
-            reference_image=reference_image,
-            media_type=media_type,
-        )
+        if config.DEV_FAKE_GENERATION == "ok":
+            image_bytes = _FAKE_IMAGE
+        elif config.DEV_FAKE_GENERATION == "fail":
+            raise ProviderTemporaryError("тест: имитация сбоя провайдера")
+        else:
+            image_bytes = await provider.generate(
+                prompt,
+                reference_image=reference_image,
+                media_type=media_type,
+            )
     except ImageRejectedError as error:
         logger.warning(
             "Отказ модерации: gen=%s user=%s username=%s prompt=%r error=%r",
