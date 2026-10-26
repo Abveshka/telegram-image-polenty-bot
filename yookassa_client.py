@@ -89,29 +89,3 @@ async def get_payment(payment_id: str) -> dict:
     if resp.status_code >= 400:
         raise YooKassaError(f"get_payment {resp.status_code}: {resp.text}", resp.status_code)
     return resp.json()
-
-
-
-
-async def _demo() -> None:
-    payment = await create_payment(
-        amount_rub=1,
-        description="Тест: первый платёж подписки",
-        metadata={"purpose": "test"},
-        save_payment_method=True,
-    )
-    print("id:     ", payment["id"])
-    print("status: ", payment["status"])
-    print("ссылка: ", payment["confirmation"]["confirmation_url"])
-    input("\nОткройте ссылку, оплатите и нажмите Enter...")
-
-    payment = await get_payment(payment["id"])
-    print("status: ", payment["status"])
-    method = payment.get("payment_method") or {}
-    print("способ оплаты сохранён:", method.get("saved"))
-    print("payment_method_id:     ", method.get("id"))
-    await aclose()
-
-
-if __name__ == "__main__":
-    asyncio.run(_demo())
