@@ -2,7 +2,7 @@ import logging
 from aiogram import Router
 from aiogram.types import ErrorEvent
 from aiogram import BaseMiddleware
-from . import admin, generation, menu, payments
+from . import admin, generation, menu, payments, subscription
 from .generation import provider
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,7 @@ router.include_routers(
     admin.router,
     menu.router,
     payments.router,
+    subscription.router,
     generation.router,
 )
 

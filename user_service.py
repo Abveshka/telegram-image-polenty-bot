@@ -181,6 +181,66 @@ async def compensate_generation(
                 return await _register_reject(session, user_id)
     return None
 
+async def grant_subscription(
+    session,
+    user_id: int,
+    tier: str,
+    period_days: int,
+    payment_method_id: str | None = None,
+) -> datetime:
+    """Выдаёт или продлевает подписку после успешной оплаты. Возвращает новый expires_at.
+    Работает в транзакции вызывающего: коммит делает он, вместе с отметкой платежа."""
+    tier_cfg = config.SUBSCRIPTION_TIERS[tier]
+    now = datetime.now(timezone.utc)
+    lead = timedelta(hours=config.RENEWAL_CHARGE_LEAD_HOURS)
+
+    sub = await session.scalar(
+        select(Subscription).where(Subscription.user_id == user_id).with_for_update()
+    )
+
+    # Если у пользователя вообще не было записи о подписке
+    if sub is None:
+        expires_at = now + timedelta(days=period_days)
+        session.add(Subscription(
+            user_id=user_id,
+            tier=tier,
+            period_days=period_days,
+            daily_limit=tier_cfg["daily_limit"],
+            expires_at=expires_at,
+            auto_renew=True,
+            payment_method_id=payment_method_id,
+            next_charge_at=expires_at - lead,
+            renewal_number=1,
+            last_charge_at=now,
+        ))
+        return expires_at
+
+    active = sub.expires_at > now
+
+    # Запрещаем покупку ТОЛЬКО если тариф и срок точно такие же, и подписка еще активна
+    if active and sub.tier == tier and sub.period_days == period_days:
+        raise ValueError(f"У вас уже активна подписка {tier} на этот же срок.")
+
+    # Для всех остальных вариантов (другой тариф, другой срок или истекшая подписка)
+    # начинаем с чистого листа от текущего момента
+    expires_at = now + timedelta(days=period_days)
+
+    sub.tier = tier
+    sub.period_days = period_days
+    sub.daily_limit = tier_cfg["daily_limit"]
+    sub.daily_used = 0
+    sub.daily_date = None
+    sub.expires_at = expires_at
+    sub.auto_renew = True
+    if payment_method_id is not None:
+        sub.payment_method_id = payment_method_id
+    sub.next_charge_at = expires_at - lead
+    sub.failed_attempts = 0
+    sub.renewal_number += 1
+    sub.last_charge_at = now
+    sub.renewal_notified_at = None
+    return expires_at
+
 async def credit_balance(
     telegram_id: int,
     username: str | None,

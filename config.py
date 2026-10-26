@@ -14,7 +14,6 @@ def _get_required(key: str) -> str:
     return value
 
 SUBSCRIPTION_TZ = ZoneInfo("Europe/Moscow")
-
 SUBSCRIPTION_TIERS = {
     "basic": {
         "title": "Basic",
@@ -31,7 +30,6 @@ SUBSCRIPTION_TIERS = {
 }
 
 PERIOD_LABELS = {7: "7 дней", 30: "1 месяц", 90: "3 месяца"}
-
 def get_subscription_price(tier: str, period_days: int) -> int | None:
     """Цена в рублях или None, если такого тарифа/периода нет."""
     tier_cfg = SUBSCRIPTION_TIERS.get(tier)
@@ -41,12 +39,18 @@ def get_subscription_price(tier: str, period_days: int) -> int | None:
 
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
-
+OFFER_URL = os.getenv("OFFER_URL", "")   # ссылка на оферту
+RENEWAL_NOTICE_HOURS = 24                # за сколько часов напоминать о списании
+PENDING_PAYMENT_TTL_HOURS = 24           # через сколько неоплаченный платёж считается просроченным
+PAYMENT_LINK_REUSE_MINUTES = 10
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 YOOKASSA_RETURN_URL = f"https://t.me/{BOT_USERNAME}"
+YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN", "")
+YOOKASSA_VAT_CODE = 1  # 1 = без НДС, для самозанятых
 
 RENEWAL_RETRY_INTERVAL_HOURS = 24
 RENEWAL_MAX_ATTEMPTS = 3
+RENEWAL_CHARGE_LEAD_HOURS = 1
 
 TELEGRAM_BOT_TOKEN = _get_required("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = _get_required("GEMINI_API_KEY")
