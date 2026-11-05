@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy.sql.functions import now
 
 import config
 import subscription_service as svc
@@ -82,15 +83,6 @@ async def cb_tier(callback: CallbackQuery) -> None:
         await callback.answer("Тариф недоступен", show_alert=True)
         return
 
-    sub = await svc.get_subscription(callback.from_user.id)
-    if _is_active(sub) and sub.tier != tier:
-        name = config.SUBSCRIPTION_TIERS[sub.tier]["title"]
-        await callback.answer(
-            f"У вас активна подписка {name}. Сменить тариф можно после её окончания.",
-            show_alert=True,
-        )
-        return
-
     await callback.answer()
     rows = [
         [_btn(f"{config.PERIOD_LABELS[days]} — {price} ₽", f"buy:sub:c:{tier}:{days}")]
@@ -123,8 +115,7 @@ async def cb_consent(callback: CallbackQuery) -> None:
         f"Стоимость: {price} ₽\n\n"
         f"🔁 Подписка продлевается автоматически на тот же срок: каждые "
         f"{config.PERIOD_LABELS[days]} с вашей карты будет списываться {price} ₽, "
-        f"пока вы не отключите автопродление (в любой момент: /subscription). "
-        f"За {config.RENEWAL_NOTICE_HOURS} ч. до списания я пришлю напоминание.\n\n"
+        f"пока вы не отключите автопродление (в любой момент: /subscription).\n\n"
         f"Нажимая «Согласен, оплатить», вы соглашаетесь с условиями автопродления{offer}."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[

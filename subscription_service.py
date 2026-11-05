@@ -2,13 +2,11 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-
-from sqlalchemy import select, update
-
+from sqlalchemy import select, update, func
 import config
 import yookassa_client as yk
-from database import Subscription, User, YookassaPayment, async_session
-from user_service import get_or_create_user, grant_subscription
+from database import Subscription, User, YookassaPayment, async_session, YookassaRefund
+from user_service import get_or_create_user, grant_subscription, credit_balance
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +16,22 @@ class SubscriptionError(Exception):
 
 
 @dataclass
+class RefundOutcome:
+    kind: str  # refunded / pending / failed
+    telegram_id: int
+    amount_rub: int
+    subscription_revoked: bool = False
+    reason: str = ""
+
+
+_REFUNDABLE = ("succeeded", "manual_review")
+_ACTIVE_REFUND_STATUSES = ("created", "pending", "succeeded")
+
+@dataclass
 class PaymentOutcome:
     """Результат обработки платежа: по нему воркер решает, что написать пользователю."""
     kind: str  # activated / activated_no_autorenew / renewed / first_failed /
-    #            renew_failed / renew_gave_up / need_confirmation / manual_review
+    #            renew_failed / renew_gave_up / need_confirmation / manual_review / tokens_activated
     telegram_id: int
     tier: str = ""
     period_days: int = 0
@@ -29,6 +39,7 @@ class PaymentOutcome:
     expires_at: datetime | None = None
     attempts_left: int = 0
     url: str | None = None
+    payment_id: str = ""
 
 
 async def get_subscription(telegram_id: int) -> Subscription | None:
@@ -167,6 +178,28 @@ async def process_payment(yk_payment_id: str) -> PaymentOutcome | None:
 
 
 async def _on_success(session, row, telegram_id, pm_id) -> PaymentOutcome:
+    base = dict(tier=row.tier, period_days=row.period_days, amount_rub=row.amount_rub)
+
+    # Обработка разовой покупки токенов
+    if row.purpose == "one_time_tokens":
+        # Извлекаем количество токенов из tier (например, из "40_tokens" получаем 40)
+        credit_amount = int(row.tier.split("_")[0]) if "_" in row.tier else 0
+
+        # Получаем username пользователя из базы для функции credit_balance
+        username = await session.scalar(
+            select(User.username).where(User.id == row.user_id)
+        )
+
+        # Начисляем токены (передавая обязательный username)
+        await credit_balance(
+            telegram_id=telegram_id,
+            username=username,
+            stars_amount=credit_amount,
+            charge_id=row.yookassa_payment_id
+        )
+
+        return PaymentOutcome("tokens_activated", telegram_id, **base)
+
     renewal = row.purpose == "subscription_renewal"
     base = dict(tier=row.tier, period_days=row.period_days, amount_rub=row.amount_rub)
 
@@ -178,14 +211,19 @@ async def _on_success(session, row, telegram_id, pm_id) -> PaymentOutcome:
 
     try:
         expires_at = await grant_subscription(
-            session, row.user_id, row.tier, row.period_days, payment_method_id=pm_id
+            session, row.user_id, row.tier, row.period_days,
+            payment_method_id=pm_id,
+            extend=renewal,
         )
     except (ValueError, KeyError):
         logger.critical(
             "ДЕНЬГИ ПОЛУЧЕНЫ, ПОДПИСКА НЕ ВЫДАНА: payment=%s user=%s tier=%s",
             row.yookassa_payment_id, row.user_id, row.tier, exc_info=True,
         )
-        return PaymentOutcome("manual_review", telegram_id, **base)
+        row.status = "manual_review"
+        return PaymentOutcome(
+            "manual_review", telegram_id, payment_id=row.yookassa_payment_id, **base
+        )
 
     sub = await session.scalar(select(Subscription).where(Subscription.user_id == row.user_id))
     row.subscription_id = sub.id
@@ -353,39 +391,6 @@ async def _charge_one(row) -> PaymentOutcome | None:
     return await process_payment(payment["id"])
 
 
-# ───────────── Напоминания и отмена ─────────────
-
-async def pop_renewal_notices(limit: int = 100) -> list[dict]:
-    """Подписки, о скором автосписании которых нужно напомнить. Сразу помечает их."""
-    now = datetime.now(timezone.utc)
-    horizon = now + timedelta(hours=config.RENEWAL_NOTICE_HOURS)
-    result = []
-    async with async_session() as session:
-        async with session.begin():
-            rows = (await session.execute(
-                select(Subscription, User.telegram_id)
-                .join(User, User.id == Subscription.user_id)
-                .where(
-                    Subscription.auto_renew.is_(True),
-                    Subscription.payment_method_id.is_not(None),
-                    Subscription.renewal_notified_at.is_(None),
-                    Subscription.expires_at > now,
-                    Subscription.expires_at <= horizon,
-                )
-                .limit(limit)
-            )).all()
-            for sub, telegram_id in rows:
-                sub.renewal_notified_at = now
-                result.append({
-                    "telegram_id": telegram_id,
-                    "tier": sub.tier,
-                    "period_days": sub.period_days,
-                    "price": config.get_subscription_price(sub.tier, sub.period_days),
-                    "expires_at": sub.expires_at,
-                })
-    return result
-
-
 async def cancel_auto_renew(telegram_id: int) -> bool:
     """Отключает автопродление и забывает сохранённый способ оплаты.
     Подписка продолжает действовать до конца оплаченного срока."""
@@ -401,3 +406,252 @@ async def cancel_auto_renew(telegram_id: int) -> bool:
                 .returning(Subscription.id)
             )
             return res.first() is not None
+
+
+async def request_refund(
+    yk_payment_id: str,
+    amount_rub: int | None = None,
+    revoke: bool = False,
+    reason: str = "",
+) -> RefundOutcome:
+    """Админский возврат денег. amount_rub=None: вернуть весь остаток.
+    revoke=True: заодно отозвать подписку (если это её последний платёж)."""
+    # ── Фаза 1: резервируем возврат в БД ──
+    async with async_session() as session:
+        async with session.begin():
+            pay = await session.scalar(
+                select(YookassaPayment)
+                .where(YookassaPayment.yookassa_payment_id == yk_payment_id)
+                .with_for_update()
+            )
+            if pay is None:
+                raise SubscriptionError("Платёж не найден")
+            if pay.status not in _REFUNDABLE:
+                raise SubscriptionError(f"Платёж в статусе {pay.status}, вернуть нельзя")
+
+            already = await session.scalar(
+                select(func.coalesce(func.sum(YookassaRefund.amount_rub), 0)).where(
+                    YookassaRefund.payment_id == pay.id,
+                    YookassaRefund.status.in_(_ACTIVE_REFUND_STATUSES),
+                )
+            )
+            available = pay.amount_rub - already
+            amount = amount_rub if amount_rub is not None else available
+            if amount <= 0 or amount > available:
+                raise SubscriptionError(f"Можно вернуть от 1 до {available} ₽")
+
+            ref = YookassaRefund(
+                payment_id=pay.id,
+                amount_rub=amount,
+                status="created",
+                idempotence_key=str(uuid.uuid4()),
+                reason=reason[:250] or None,
+                revoke_subscription=revoke,
+            )
+            session.add(ref)
+            await session.flush()
+            ref_id, key = ref.id, ref.idempotence_key
+
+            telegram_id = await session.scalar(
+                select(User.telegram_id).where(User.id == pay.user_id)
+            )
+            if revoke and pay.subscription_id:
+                # Сразу стопаем автосписания, чтобы воркер не списал деньги заново
+                await session.execute(
+                    update(Subscription)
+                    .where(Subscription.id == pay.subscription_id)
+                    .values(auto_renew=False, next_charge_at=None)
+                )
+
+    # ── Фаза 2: запрос в ЮKassa ──
+    try:
+        data = await yk.create_refund(
+            payment_id=yk_payment_id,
+            amount_rub=amount,
+            idempotence_key=key,
+            description=reason or "Возврат платежа",
+        )
+    except yk.YooKassaError as e:
+        if e.status_code and 400 <= e.status_code < 500:
+            await _mark_refund_canceled(ref_id, str(e))
+            raise SubscriptionError(f"ЮKassa отклонила возврат: {e}")
+        # сеть или 5xx: строка осталась 'created', sync_pending_refunds повторит с тем же ключом
+        logger.error("Возврат %s: сбой запроса, нужен sync: %s", ref_id, e)
+        return RefundOutcome("pending", telegram_id, amount)
+
+    return await _finalize_refund(ref_id, data)
+
+
+async def _mark_refund_canceled(ref_id: int, reason: str) -> None:
+    async with async_session() as session:
+        async with session.begin():
+            await session.execute(
+                update(YookassaRefund)
+                .where(YookassaRefund.id == ref_id, YookassaRefund.applied_at.is_(None))
+                .values(status="canceled", reason=reason[:250],
+                        applied_at=datetime.now(timezone.utc))
+            )
+
+
+async def _finalize_refund(ref_id: int, data: dict) -> RefundOutcome:
+    """Применяет ответ ЮKassa. Безопасно вызывать повторно (applied_at)."""
+    status = data.get("status")
+    now = datetime.now(timezone.utc)
+
+    async with async_session() as session:
+        async with session.begin():
+            ref = await session.scalar(
+                select(YookassaRefund).where(YookassaRefund.id == ref_id).with_for_update()
+            )
+            pay = await session.scalar(
+                select(YookassaPayment).where(YookassaPayment.id == ref.payment_id).with_for_update()
+            )
+            telegram_id = await session.scalar(
+                select(User.telegram_id).where(User.id == pay.user_id)
+            )
+
+            if ref.applied_at is not None:
+                return RefundOutcome(
+                    "refunded" if ref.status == "succeeded" else "failed",
+                    telegram_id, ref.amount_rub,
+                )
+
+            ref.yookassa_refund_id = data.get("id") or ref.yookassa_refund_id
+
+            if status == "canceled":
+                reason = (data.get("cancellation_details") or {}).get("reason") or "canceled"
+                ref.status, ref.reason, ref.applied_at = "canceled", reason[:250], now
+                logger.error("Возврат %s отменён ЮKassa: %s", ref.id, reason)
+                return RefundOutcome("failed", telegram_id, ref.amount_rub, reason=reason)
+
+            if status != "succeeded":
+                ref.status = "pending"
+                return RefundOutcome("pending", telegram_id, ref.amount_rub)
+
+            ref.status, ref.applied_at = "succeeded", now
+
+            total_refunded = await session.scalar(
+                select(func.coalesce(func.sum(YookassaRefund.amount_rub), 0)).where(
+                    YookassaRefund.payment_id == pay.id,
+                    YookassaRefund.status == "succeeded",
+                )
+            )
+            if total_refunded >= pay.amount_rub:
+                pay.status = "refunded"
+
+            revoked = False
+            if ref.revoke_subscription and pay.subscription_id:
+                # Отзываем, только если это последний оплаченный платёж подписки,
+                # иначе возврат старого периода убил бы свежеоплаченный
+                last_paid_id = await session.scalar(
+                    select(YookassaPayment.id)
+                    .where(
+                        YookassaPayment.subscription_id == pay.subscription_id,
+                        YookassaPayment.status.in_(("succeeded", "refunded")),
+                        YookassaPayment.purpose.in_(
+                            ("subscription_first", "subscription_renewal")
+                        ),
+                    )
+                    .order_by(YookassaPayment.processed_at.desc())
+                    .limit(1)
+                )
+                if last_paid_id == pay.id:
+                    await session.execute(
+                        update(Subscription)
+                        .where(Subscription.id == pay.subscription_id)
+                        .values(
+                            expires_at=func.least(Subscription.expires_at, now),
+                            auto_renew=False,
+                            next_charge_at=None,
+                            payment_method_id=None,
+                        )
+                    )
+                    revoked = True
+
+            return RefundOutcome("refunded", telegram_id, ref.amount_rub,
+                                 subscription_revoked=revoked)
+
+
+async def sync_pending_refunds(limit: int = 50) -> list[RefundOutcome]:
+    """Доводит возвраты в created/pending. Запускается командой /refund_sync или из воркера."""
+    async with async_session() as session:
+        rows = (await session.execute(
+            select(
+                YookassaRefund.id, YookassaRefund.yookassa_refund_id,
+                YookassaRefund.idempotence_key, YookassaRefund.amount_rub,
+                YookassaRefund.reason, YookassaPayment.yookassa_payment_id,
+            )
+            .join(YookassaPayment, YookassaPayment.id == YookassaRefund.payment_id)
+            .where(YookassaRefund.status.in_(("created", "pending")))
+            .order_by(YookassaRefund.created_at)
+            .limit(limit)
+        )).all()
+
+    outcomes: list[RefundOutcome] = []
+    for r in rows:
+        try:
+            if r.yookassa_refund_id:
+                data = await yk.get_refund(r.yookassa_refund_id)
+            else:  # запрос не дошёл: повторяем с тем же ключом, дубля не будет
+                data = await yk.create_refund(
+                    payment_id=r.yookassa_payment_id, amount_rub=r.amount_rub,
+                    idempotence_key=r.idempotence_key,
+                    description=r.reason or "Возврат платежа",
+                )
+            out = await _finalize_refund(r.id, data)
+        except Exception:
+            logger.exception("sync_pending_refunds: refund=%s", r.id)
+            continue
+        if out.kind != "pending":
+            outcomes.append(out)
+    return outcomes
+
+
+async def manual_grant_for_payment(yk_payment_id: str) -> tuple[int, datetime]:
+    """Ручная выдача подписки за платёж в статусе manual_review.
+    Возвращает (telegram_id, новый expires_at)."""
+    async with async_session() as session:
+        async with session.begin():
+            pay = await session.scalar(
+                select(YookassaPayment)
+                .where(YookassaPayment.yookassa_payment_id == yk_payment_id)
+                .with_for_update()
+            )
+            if pay is None:
+                raise SubscriptionError("Платёж не найден")
+            if pay.status != "manual_review":
+                raise SubscriptionError(
+                    f"Платёж в статусе {pay.status}: выдавать подписку вручную не нужно"
+                )
+
+            refunding = await session.scalar(
+                select(YookassaRefund.id).where(
+                    YookassaRefund.payment_id == pay.id,
+                    YookassaRefund.status.in_(_ACTIVE_REFUND_STATUSES),
+                )
+            )
+            if refunding is not None:
+                raise SubscriptionError("По платежу уже есть возврат")
+
+            try:
+                expires_at = await grant_subscription(
+                    session, pay.user_id, pay.tier, pay.period_days, extend=True
+                )
+            except (ValueError, KeyError) as e:
+                raise SubscriptionError(f"Не удалось выдать: {e}")
+
+            sub = await session.scalar(
+                select(Subscription).where(Subscription.user_id == pay.user_id)
+            )
+            if not sub.payment_method_id:
+                # Карта не сохранена: автопродлению нечем списывать
+                sub.auto_renew = False
+                sub.next_charge_at = None
+
+            pay.subscription_id = sub.id
+            pay.status = "succeeded"
+
+            telegram_id = await session.scalar(
+                select(User.telegram_id).where(User.id == pay.user_id)
+            )
+    return telegram_id, expires_at

@@ -187,6 +187,7 @@ async def grant_subscription(
     tier: str,
     period_days: int,
     payment_method_id: str | None = None,
+    extend: bool = False,
 ) -> datetime:
     """Выдаёт или продлевает подписку после успешной оплаты. Возвращает новый expires_at.
     Работает в транзакции вызывающего: коммит делает он, вместе с отметкой платежа."""
@@ -216,20 +217,22 @@ async def grant_subscription(
         return expires_at
 
     active = sub.expires_at > now
+    same_plan = sub.tier == tier and sub.period_days == period_days
 
-    # Запрещаем покупку ТОЛЬКО если тариф и срок точно такие же, и подписка еще активна
-    if active and sub.tier == tier and sub.period_days == period_days:
-        raise ValueError(f"У вас уже активна подписка {tier} на этот же срок.")
+    if active and same_plan and not extend:
+        raise ValueError(f"У вас уже активна подписка {tier} на этот же срок. Можете поменять на подписку другого уровня прямо сейчас или дождавшись окончания текущей")
 
-    # Для всех остальных вариантов (другой тариф, другой срок или истекшая подписка)
-    # начинаем с чистого листа от текущего момента
-    expires_at = now + timedelta(days=period_days)
+    # extend: прибавляем к оставшемуся сроку, если тариф тот же и подписка активна
+    extending = extend and active and sub.tier == tier
+    base = sub.expires_at if extending else now
+    expires_at = base + timedelta(days=period_days)
 
     sub.tier = tier
     sub.period_days = period_days
     sub.daily_limit = tier_cfg["daily_limit"]
-    sub.daily_used = 0
-    sub.daily_date = None
+    if not extending:  # при продлении не сбрасываем дневной счётчик
+        sub.daily_used = 0
+        sub.daily_date = None
     sub.expires_at = expires_at
     sub.auto_renew = True
     if payment_method_id is not None:

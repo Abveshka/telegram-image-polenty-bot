@@ -40,7 +40,6 @@ def get_subscription_price(tier: str, period_days: int) -> int | None:
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
 OFFER_URL = os.getenv("OFFER_URL", "")   # ссылка на оферту
-RENEWAL_NOTICE_HOURS = 24                # за сколько часов напоминать о списании
 PENDING_PAYMENT_TTL_HOURS = 24           # через сколько неоплаченный платёж считается просроченным
 PAYMENT_LINK_REUSE_MINUTES = 10
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")

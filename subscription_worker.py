@@ -40,9 +40,15 @@ def _message_for(o: svc.PaymentOutcome) -> tuple[str, InlineKeyboardMarkup | Non
     if o.kind == "activated":
         return (
             f"✅ Подписка <b>{t}</b> активна до {until} (МСК).\n\n"
-            f"Она продлится автоматически. За {config.RENEWAL_NOTICE_HOURS} ч. до списания "
-            f"пришлю напоминание. Отключить автопродление можно в любой момент: /subscription"
+            f"Она продлится автоматически. Отключить автопродление можно в любой момент: /subscription"
         ), None
+    if o.kind == "tokens_activated":
+        credit_amount = int(o.tier.split("_")[0]) if "_" in o.tier else 0
+        return (
+            f"✅ Оплата прошла успешно! Начислено <b>{credit_amount} токенов</b> на ваш баланс. "
+            f"Списано: {o.amount_rub} ₽.",
+            None
+        )
     if o.kind == "activated_no_autorenew":
         return (
             f"✅ Подписка <b>{t}</b> активна до {until} (МСК).\n\n"
@@ -92,11 +98,18 @@ async def _send(bot: Bot, chat_id: int, text: str, markup=None) -> None:
 async def _notify(bot: Bot, o: svc.PaymentOutcome) -> None:
     text, markup = _message_for(o)
     await _send(bot, o.telegram_id, text, markup)
-    if o.kind == "manual_review" and config.ADMIN_ID:
+    if o.kind == "manual_review":
+        if not config.ADMIN_ID:
+            logger.critical("manual_review, но ADMIN_ID не задан: payment=%s", o.payment_id)
+            return
         await _send(
             bot, config.ADMIN_ID,
-            f"⚠️ Нужен ручной разбор: user={o.telegram_id}, {o.tier}/{o.period_days}, "
-            f"{o.amount_rub} ₽. Подробности в logs/bot.log (CRITICAL).",
+            f"⚠️ Нужен ручной разбор\n"
+            f"user: {o.telegram_id}\n"
+            f"тариф: {o.tier} / {o.period_days} дн., {o.amount_rub} ₽\n"
+            f"payment: {o.payment_id}\n\n"
+            f"Выдать подписку: /grant_sub {o.payment_id}\n"
+            f"Вернуть деньги: /refund {o.payment_id}",
         )
 
 
@@ -160,15 +173,6 @@ async def _poll_pending(bot: Bot) -> None:
 async def _renew_and_remind(bot: Bot) -> None:
     for outcome in await svc.charge_due_renewals():
         await _notify(bot, outcome)
-
-    for n in await svc.pop_renewal_notices():
-        if n["price"] is None:
-            continue
-        await _send(
-            bot, n["telegram_id"],
-            f"🔔 Подписка <b>{_title(n['tier'])}</b> действует до {_fmt(n['expires_at'])} (МСК) "
-            f"и продлится автоматически: спишем {n['price']} ₽"
-        )
 
 
 async def subscription_worker(bot: Bot) -> None:

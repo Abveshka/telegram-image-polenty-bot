@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from sqlalchemy import (
     String, BigInteger, ForeignKey, Numeric, DateTime, Date, Boolean,
-    Index, func, UniqueConstraint,
+    Index, func, UniqueConstraint, Column, Integer, false, Text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
@@ -123,11 +123,11 @@ class YookassaPayment(Base):
     period_days: Mapped[int]
     amount_rub: Mapped[int]
 
-    # pending / succeeded / canceled / expired
+    # pending / succeeded / canceled / expired / manual_review / refunded
     status: Mapped[str] = mapped_column(String(16), default="pending", server_default="pending")
     cancellation_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     idempotence_key: Mapped[str] = mapped_column(String(64))
-    confirmation_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    confirmation_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # Когда в последний раз спрашивали статус у ЮKassa: по нему фоновая задача проверяет старые платежи реже
@@ -136,6 +136,30 @@ class YookassaPayment(Base):
 
     __table_args__ = (
         Index("ix_yk_payments_status_created", "status", "created_at"),
+    )
+
+
+class YookassaRefund(Base):
+    __tablename__ = "yookassa_refunds"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("yookassa_payments.id"), index=True)
+    yookassa_refund_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+
+    amount_rub: Mapped[int]
+    # created / pending / succeeded / canceled
+    status: Mapped[str] = mapped_column(String(16), default="created", server_default="created")
+    idempotence_key: Mapped[str] = mapped_column(String(64), unique=True)
+    reason: Mapped[str | None] = mapped_column(String(250), nullable=True)
+    revoke_subscription: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false()
+    )
+
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_yk_refunds_status_created", "status", "created_at"),
     )
 
 _async_db_url = config.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)

@@ -1,12 +1,14 @@
 import json
 import logging
-
+import uuid
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, LabeledPrice, Message, PreCheckoutQuery
-
+import yookassa_client as yk
 import config
-from user_service import credit_balance, get_balance
+from database import YookassaPayment, async_session
+from user_service import credit_balance, get_balance, get_or_create_user
 from .keyboards import (
     buy_menu_keyboard,
     packages_keyboard,
@@ -171,13 +173,12 @@ async def cb_pay_stars(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("buy:rub:"))
 async def cb_pay_rub(callback: CallbackQuery) -> None:
-    """Оплата картой через ЮKassa (встроенное окно оплаты Telegram)."""
-    if callback.message is None or callback.data is None:
+    """Оплата разового пакета токенов через API ЮKassa."""
+    if callback.message is None or callback.data is None or callback.from_user is None:
         await callback.answer()
         return
 
-    # Токен ЮKassa не задан в .env, оплату картой выключаем
-    if not config.YOOKASSA_PROVIDER_TOKEN:
+    if not config.YOOKASSA_SHOP_ID or not config.YOOKASSA_SECRET_KEY:
         await callback.answer("Оплата картой временно недоступна", show_alert=True)
         return
 
@@ -188,35 +189,66 @@ async def cb_pay_rub(callback: CallbackQuery) -> None:
 
     rub = package["rub_to_pay"]
     item_name = _item_name(package)
+    telegram_user = callback.from_user
+    credit_stars = package["credit_stars"]
+    package_tier = f"{credit_stars}_tokens"
 
-    # Данные для чека по 54-ФЗ: что продали, за сколько, с каким НДС
-    provider_data = {
-        "receipt": {
-            "items": [
-                {
-                    "description": item_name[:128],
-                    "quantity": "1.00",
-                    "amount": {"value": f"{rub:.2f}", "currency": "RUB"},
-                    "vat_code": config.YOOKASSA_VAT_CODE,
-                    "payment_mode": "full_payment",
-                    "payment_subject": "service",
-                }
+    # Получаем или создаем пользователя в БД, чтобы получить его внутренний user.id для ForeignKey
+    user = await get_or_create_user(telegram_user.id, telegram_user.username)
+
+    key = str(uuid.uuid4())
+
+    try:
+        # Создаем разовый платеж через ваш клиент yookassa_client (yk)
+        payment = await yk.create_payment(
+            amount_rub=rub,
+            description=f"{item_name} ({credit_stars} токенов)",
+            metadata={
+                "user_id": user.id,              # Внутренний ID пользователя в БД
+                "telegram_id": telegram_user.id,  # Telegram ID для логирования/уведомлений
+                "credit_stars": credit_stars,
+                "purpose": "one_time_tokens",
+            },
+            save_payment_method=False,
+            idempotence_key=key,
+        )
+
+        url = payment["confirmation"]["confirmation_url"]
+
+        # Сохраняем платёж в БД, используя внутренний user.id
+        async with async_session() as session:
+            async with session.begin():
+                session.add(YookassaPayment(
+                    yookassa_payment_id=payment["id"],
+                    user_id=user.id,          # <--- Передаем внутренний primary key из таблицы users
+                    purpose="one_time_tokens",
+                    tier=package_tier,
+                    period_days=0,
+                    amount_rub=rub,
+                    idempotence_key=key,
+                    confirmation_url=url,
+                ))
+
+        # Отправляем пользователю кнопку со ссылкой на оплату
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Оплатить картой", url=url)],
+                [InlineKeyboardButton(text="« Назад", callback_data="buy:tokens")]
             ]
-        }
-    }
+        )
 
-    await callback.answer()
-    await callback.message.answer_invoice(
-        title=item_name[:32],  # лимит Telegram на заголовок: 32 символа
-        description=f"{item_name} ({package['credit_stars']} токенов на баланс бота)",
-        payload=make_payload("yk", package["credit_stars"]),
-        provider_token=config.YOOKASSA_PROVIDER_TOKEN,
-        currency="RUB",
-        prices=[LabeledPrice(label=item_name[:32], amount=rub * 100)],  # в копейках!
-        need_email=True,               # Telegram сам спросит email для чека
-        send_email_to_provider=True,   # и передаст его в ЮKassa
-        provider_data=json.dumps(provider_data, ensure_ascii=False),
-    )
+        await callback.answer()
+        await callback.message.edit_text(
+            f"<b>{item_name}</b>\n"
+            f"Сумма к оплате: <b>{rub} ₽</b>\n\n"
+            "Нажмите кнопку ниже, чтобы перейти на защищенную страницу оплаты.",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка создания разового платежа в ЮKassa для user {telegram_user.id}: {e}", exc_info=True)
+        await callback.answer("Не удалось создать платеж. Попробуйте позже.", show_alert=True)
 
 
 # ───────────── Проверка перед оплатой и после неё ─────────────

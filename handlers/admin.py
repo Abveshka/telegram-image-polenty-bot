@@ -1,11 +1,14 @@
 import logging
 import re
 import time
+
+import subscription_service as svc
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 import config
+from subscription_worker import _fmt
 from user_service import (
     credit_balance, get_balance, reserve_payment_refund, undo_payment_refund,
 )
@@ -13,14 +16,19 @@ from user_service import (
 logger = logging.getLogger(__name__)
 router = Router(name="admin")
 
+def _is_admin(message: Message) -> bool:
+    return message.from_user is not None and message.from_user.id == config.ADMIN_ID
+
+
+
 #Возвращает звезды
-@router.message(Command("refund"))
+@router.message(Command("refund_stars"))
 async def handle_refund(message: Message, command: CommandObject, bot: Bot) -> None:
-    if message.from_user is None or message.from_user.id != config.ADMIN_ID:
+    if not _is_admin(message):
         return
 
     if not command.args:
-        await message.answer("Использование: /refund <charge_id>")
+        await message.answer("Использование: /refund_stars <charge_id>")
         return
 
     charge_id = command.args.strip()
@@ -47,7 +55,7 @@ async def handle_refund(message: Message, command: CommandObject, bot: Bot) -> N
 #Начисляет токены
 @router.message(Command("compensate"))
 async def handle_compensate(message: Message, command: CommandObject, bot: Bot) -> None:
-    if message.from_user is None or message.from_user.id != config.ADMIN_ID:
+    if not _is_admin(message):
         return
 
     usage = (
@@ -103,3 +111,79 @@ async def handle_compensate(message: Message, command: CommandObject, bot: Bot) 
         )
     except Exception:
         logger.warning("Не удалось уведомить юзера %s о компенсации", target_id)
+
+
+@router.message(Command("refund"))
+async def cmd_refund(message: Message, command: CommandObject, bot: Bot) -> None:
+    """/refund <payment_id> [сумма] [revoke]"""
+    if not _is_admin(message):
+        return
+    tokens = (command.args or "").split()
+    if not tokens:
+        await message.answer("Формат: /refund <yookassa_payment_id> [сумма] [revoke]")
+        return
+
+    amount = next((int(t) for t in tokens[1:] if t.isdigit()), None)
+    revoke = "revoke" in tokens[1:]
+
+    try:
+        out = await svc.request_refund(tokens[0], amount, revoke=revoke, reason="Возврат")
+    except svc.SubscriptionError as e:
+        await message.answer(f"❌ {e}")
+        return
+
+    await message.answer(
+        f"Возврат {out.amount_rub} ₽: {out.kind}"
+        + (", подписка отозвана" if out.subscription_revoked else "")
+        + ("\nЗапрос не завершён, выполните /refund_sync" if out.kind == "pending" else "")
+    )
+    await _notify_refund(bot, out)
+
+
+@router.message(Command("refund_sync"))
+async def cmd_refund_sync(message: Message, bot: Bot) -> None:
+    if not _is_admin(message):
+        return
+    outs = await svc.sync_pending_refunds()
+    await message.answer(f"Обработано возвратов: {len(outs)}")
+    for out in outs:
+        await _notify_refund(bot, out)
+
+
+@router.message(Command("grant_sub"))
+async def cmd_grant_sub(message: Message, command: CommandObject, bot: Bot) -> None:
+    """/grant_sub <payment_id>: выдать подписку за платёж в статусе manual_review"""
+    if not _is_admin(message):
+        return
+    pid = (command.args or "").strip()
+    if not pid:
+        await message.answer("Формат: /grant_sub <yookassa_payment_id>")
+        return
+    try:
+        telegram_id, expires_at = await svc.manual_grant_for_payment(pid)
+    except svc.SubscriptionError as e:
+        await message.answer(f"❌ {e}")
+        return
+
+    await message.answer(f"✅ Подписка выдана до {_fmt(expires_at)} (МСК)")
+    try:
+        await bot.send_message(
+            telegram_id,
+            f"✅ Приносим извинения за задержку: ваша подписка активирована до "
+            f"{_fmt(expires_at)} (МСК).",
+        )
+    except Exception:
+        logger.warning("Не удалось уведомить %s о выдаче подписки", telegram_id)
+
+
+async def _notify_refund(bot: Bot, out: svc.RefundOutcome) -> None:
+    if out.kind == "refunded":
+        text = (f"💸 Мы вернули вам {out.amount_rub} ₽. Деньги придут на карту "
+                f"в течение нескольких дней (зависит от банка)."
+                + (" Подписка отключена." if out.subscription_revoked else ""))
+    else:
+        return
+    try:
+        await bot.send_message(out.telegram_id, text)
+    except Exception:
+        logger.warning("Не удалось уведомить %s о возврате", out.telegram_id)

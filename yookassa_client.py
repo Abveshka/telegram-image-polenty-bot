@@ -89,3 +89,35 @@ async def get_payment(payment_id: str) -> dict:
     if resp.status_code >= 400:
         raise YooKassaError(f"get_payment {resp.status_code}: {resp.text}", resp.status_code)
     return resp.json()
+
+async def create_refund(
+    *, payment_id: str, amount_rub: int, idempotence_key: str, description: str | None = None
+) -> dict:
+    body: dict = {
+        "payment_id": payment_id,
+        "amount": {"value": f"{amount_rub:.2f}", "currency": "RUB"},
+    }
+    if description:
+        body["description"] = description[:250]
+
+    try:
+        resp = await _get_client().post(
+            "/refunds", json=body, headers={"Idempotence-Key": idempotence_key}
+        )
+    except httpx.HTTPError as e:
+        raise YooKassaError(f"Сеть: {e!r}") from e
+
+    if resp.status_code >= 400:
+        raise YooKassaError(f"create_refund {resp.status_code}: {resp.text}", resp.status_code)
+    return resp.json()
+
+
+async def get_refund(refund_id: str) -> dict:
+    try:
+        resp = await _get_client().get(f"/refunds/{refund_id}")
+    except httpx.HTTPError as e:
+        raise YooKassaError(f"Сеть: {e!r}") from e
+
+    if resp.status_code >= 400:
+        raise YooKassaError(f"get_refund {resp.status_code}: {resp.text}", resp.status_code)
+    return resp.json()
