@@ -162,6 +162,24 @@ class YookassaRefund(Base):
         Index("ix_yk_refunds_status_created", "status", "created_at"),
     )
 
+class StarsPayment(Base):
+    __tablename__ = "stars_payments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    subscription_id: Mapped[int | None] = mapped_column(ForeignKey("subscriptions.id"), nullable=True)
+
+    tier: Mapped[str] = mapped_column(String(16))
+    period_days: Mapped[int]
+    amount_stars: Mapped[int]
+
+    # unique даёт идемпотентность: повторный апдейт от Telegram не выдаст подписку второй раз
+    telegram_charge_id: Mapped[str] = mapped_column(String(128), unique=True)
+    provider_charge_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(16), default="succeeded", server_default="succeeded")  # succeeded / manual_review / refunded
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
 _async_db_url = config.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 engine = create_async_engine(_async_db_url, echo=False)

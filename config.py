@@ -20,12 +20,14 @@ SUBSCRIPTION_TIERS = {
         "emoji": "🔹",
         "daily_limit": 3,
         "prices": {7: 179, 30: 390, 90: 990},
+        "stars_prices": {7: 179, 30: 390, 90: 990},
     },
     "pro": {
         "title": "Pro",
         "emoji": "⚡",
         "daily_limit": 7,
         "prices": {7: 279, 30: 590, 90: 1490},
+        "stars_prices": {7: 279, 30: 590, 90: 1490},
     },
 }
 
@@ -36,6 +38,12 @@ def get_subscription_price(tier: str, period_days: int) -> int | None:
     if tier_cfg is None:
         return None
     return tier_cfg["prices"].get(period_days)
+
+def get_subscription_stars_price(tier: str, days: int) -> int | None:
+    cfg = SUBSCRIPTION_TIERS.get(tier)
+    if cfg is None:
+        return None
+    return (cfg.get("stars_prices") or {}).get(days)
 
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
@@ -75,9 +83,9 @@ OPENROUTER_MANAGEMENT_KEY = os.environ["OPENROUTER_MANAGEMENT_KEY"]
 
 PRICE_PER_GENERATION_STARS = 10
 STAR_PACKAGES = [
-    {"label": "TEST 1 ★ → 1 генерация", "credit_stars": 10, "stars_to_pay": 1, "rub_to_pay": 1},
-    {"label": "+4 Генерации | 119 руб/звезд", "credit_stars": 40, "stars_to_pay": 119, "rub_to_pay": 119},
-    {"label": "+10 Генерации | 279 руб/звезд", "credit_stars": 100, "stars_to_pay": 279, "rub_to_pay": 279},
-    {"label": "+25 Генерации | 649 руб/звезд", "credit_stars": 250, "stars_to_pay": 649, "rub_to_pay": 649},
-    {"label": "+40 Генерации | 999 руб/звезд", "credit_stars": 400, "stars_to_pay": 999, "rub_to_pay": 999},
+    #{"label": "TEST 1 ★ → 1 генерация", "credit_stars": 10, "stars_to_pay": 1, "rub_to_pay": 1},
+    {"label": "40 токенов (4 генерации) | 119 руб/звезд", "credit_stars": 40, "stars_to_pay": 119, "rub_to_pay": 119},
+    {"label": "100 токенов (10 генераций) | 279 руб/звезд", "credit_stars": 100, "stars_to_pay": 279, "rub_to_pay": 279},
+    {"label": "250 токенов (25 генераций) | 649 руб/звезд", "credit_stars": 250, "stars_to_pay": 649, "rub_to_pay": 649},
+    {"label": "400 токенов (40 генераций) | 999 руб/звезд", "credit_stars": 400, "stars_to_pay": 999, "rub_to_pay": 999},
 ]

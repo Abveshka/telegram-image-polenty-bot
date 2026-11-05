@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, update, func
 import config
+from sqlalchemy.exc import IntegrityError
 import yookassa_client as yk
-from database import Subscription, User, YookassaPayment, async_session, YookassaRefund
+from database import Subscription, User, YookassaPayment, async_session, YookassaRefund, StarsPayment
 from user_service import get_or_create_user, grant_subscription, credit_balance
 
 logger = logging.getLogger(__name__)
@@ -655,3 +656,108 @@ async def manual_grant_for_payment(yk_payment_id: str) -> tuple[int, datetime]:
                 select(User.telegram_id).where(User.id == pay.user_id)
             )
     return telegram_id, expires_at
+
+@dataclass
+class StarsOutcome:
+    kind: str  # activated / duplicate / manual_review
+    expires_at: datetime | None = None
+
+
+def burn_warning(sub: Subscription | None, tier: str, period_days: int) -> str | None:
+    """Предупреждение, если новая подписка заменит активную и остаток сгорит."""
+    if sub is None or sub.expires_at <= datetime.now(timezone.utc):
+        return None
+    if sub.tier == tier and sub.period_days == period_days:
+        return None  # этот случай отсекается отдельно: «уже активна»
+    title = config.SUBSCRIPTION_TIERS.get(sub.tier, {}).get("title", sub.tier)
+    until = sub.expires_at.astimezone(config.SUBSCRIPTION_TZ).strftime("%d.%m.%Y %H:%M")
+    return (
+        f"⚠️ У вас активна подписка <b>{title}</b> до {until} (МСК). "
+        f"Новая подписка заменит её, остаток дней из прошлой подписки сгорит!"
+    )
+
+
+async def validate_stars_purchase(telegram_id: int, tier: str, period_days: int) -> int:
+    """Проверяет, можно ли сейчас купить подписку за звёзды. Возвращает цену в звёздах.
+    Только быстрые чтения БД: вызывается из pre_checkout (лимит ~10 секунд)."""
+    price = config.get_subscription_stars_price(tier, period_days)
+    if price is None:
+        raise SubscriptionError("Такого тарифа нет. Откройте меню подписки заново.")
+
+    now = datetime.now(timezone.utc)
+    async with async_session() as session:
+        sub = await session.scalar(
+            select(Subscription)
+            .join(User, User.id == Subscription.user_id)
+            .where(User.telegram_id == telegram_id)
+        )
+        if sub is not None:
+            if sub.expires_at > now and sub.tier == tier and sub.period_days == period_days:
+                name = config.SUBSCRIPTION_TIERS[tier]["title"]
+                raise SubscriptionError(f"У вас уже активна подписка {name} на этот же срок.")
+
+            # Автопродление картой уже в пути: иначе человек заплатит дважды
+            renewing = await session.scalar(
+                select(YookassaPayment.id).where(
+                    YookassaPayment.subscription_id == sub.id,
+                    YookassaPayment.purpose == "subscription_renewal",
+                    YookassaPayment.status == "pending",
+                ).limit(1)
+            )
+            if renewing is not None:
+                raise SubscriptionError(
+                    "Сейчас обрабатывается автопродление подписки. Подождите пару минут и попробуйте снова."
+                )
+    return price
+
+
+async def activate_subscription_with_stars(
+    telegram_id: int,
+    username: str | None,
+    tier: str,
+    period_days: int,
+    amount_stars: int,
+    charge_id: str,
+    provider_charge_id: str | None,
+) -> StarsOutcome:
+    """Деньги (звёзды) уже списаны. Одна транзакция: запись платежа + выдача подписки."""
+    user = await get_or_create_user(telegram_id, username)
+
+    try:
+        async with async_session() as session:
+            async with session.begin():
+                pay = StarsPayment(
+                    user_id=user.id,
+                    tier=tier,
+                    period_days=period_days,
+                    amount_stars=amount_stars,
+                    telegram_charge_id=charge_id,
+                    provider_charge_id=provider_charge_id,
+                    status="succeeded",
+                )
+                session.add(pay)
+                await session.flush()  # дубль charge_id упадёт здесь, до изменения подписки
+
+                try:
+                    expires_at = await grant_subscription(
+                        session, user.id, tier, period_days,
+                        extend=False, auto_renew=False,
+                    )
+                except (ValueError, KeyError):
+                    # grant_subscription бросает до любых записей, так что состояние чистое.
+                    # Платёж сохраняем в manual_review, чтобы не потерять.
+                    logger.critical(
+                        "ЗВЁЗДЫ ПОЛУЧЕНЫ, ПОДПИСКА НЕ ВЫДАНА: user=%s tier=%s days=%s charge_id=%s",
+                        telegram_id, tier, period_days, charge_id, exc_info=True,
+                    )
+                    pay.status = "manual_review"
+                    return StarsOutcome("manual_review")
+
+                sub_id = await session.scalar(
+                    select(Subscription.id).where(Subscription.user_id == user.id)
+                )
+                pay.subscription_id = sub_id
+                return StarsOutcome("activated", expires_at=expires_at)
+    except IntegrityError:
+        logger.warning("Дубликат звёздного платежа: user=%s charge_id=%s", telegram_id, charge_id)
+        return StarsOutcome("duplicate")

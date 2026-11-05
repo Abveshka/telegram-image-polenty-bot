@@ -188,6 +188,7 @@ async def grant_subscription(
     period_days: int,
     payment_method_id: str | None = None,
     extend: bool = False,
+    auto_renew: bool = True,
 ) -> datetime:
     """Выдаёт или продлевает подписку после успешной оплаты. Возвращает новый expires_at.
     Работает в транзакции вызывающего: коммит делает он, вместе с отметкой платежа."""
@@ -234,10 +235,15 @@ async def grant_subscription(
         sub.daily_used = 0
         sub.daily_date = None
     sub.expires_at = expires_at
-    sub.auto_renew = True
-    if payment_method_id is not None:
-        sub.payment_method_id = payment_method_id
-    sub.next_charge_at = expires_at - lead
+    sub.auto_renew = auto_renew
+    if auto_renew:
+        if payment_method_id is not None:
+            sub.payment_method_id = payment_method_id
+        sub.next_charge_at = expires_at - lead
+    else:
+        # Оплата звёздами: старую карту и расписание списаний стираем
+        sub.payment_method_id = None
+        sub.next_charge_at = None
     sub.failed_attempts = 0
     sub.renewal_number += 1
     sub.last_charge_at = now
