@@ -77,7 +77,7 @@ def _plural_generations(n: int) -> str:
 def _item_name(package: dict) -> str:
     """Название товара для счёта и чека. Без эмодзи, их ОФД может не принять."""
     n = package["credit_stars"] // config.PRICE_PER_GENERATION_STARS
-    return f"Баланс: {n} {_plural_generations(n)}"
+    return f"Баланс: {n * config.PRICE_PER_GENERATION_STARS} токенов | {n} {_plural_generations(n)}"
 
 
 # ───────────── Навигация по меню (только меняют экран) ─────────────
@@ -252,8 +252,7 @@ async def cb_pay_rub(callback: CallbackQuery) -> None:
 
 
 # ───────────── Проверка перед оплатой и после неё ─────────────
-
-@router.pre_checkout_query()
+@router.pre_checkout_query(~F.invoice_payload.startswith("sub:"))
 async def handle_pre_checkout(query: PreCheckoutQuery) -> None:
     """Telegram спрашивает «всё ок?» перед списанием денег. Нужно ответить за ~10 секунд.
     Проверяем, что пакет существует, а валюта и сумма совпадают с ожидаемыми."""
@@ -274,7 +273,7 @@ async def handle_pre_checkout(query: PreCheckoutQuery) -> None:
     await query.answer(ok=True)
 
 
-@router.message(F.successful_payment)
+@router.message(F.successful_payment & ~F.successful_payment.invoice_payload.startswith("sub:"))
 async def handle_successful_payment(message: Message) -> None:
     """Деньги уже списаны: начисляем токены и пишем пользователю."""
     if message.from_user is None or message.successful_payment is None:

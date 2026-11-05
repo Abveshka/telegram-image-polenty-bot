@@ -38,7 +38,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💎 Пополнить баланс", callback_data="menu:buy")],
-            [InlineKeyboardButton(text="💎 Оформить подписку ", callback_data="buy:subscription")],
+            [InlineKeyboardButton(text="💳 Оформить подписку ", callback_data="buy:subscription")],
             [InlineKeyboardButton(text="🖼 Генерация картинок", callback_data="menu:generate")],
             [InlineKeyboardButton(text="💰 Баланс", callback_data="menu:balance")],
         ]
@@ -50,7 +50,7 @@ def start_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📋 Меню", callback_data="buy:main")],
             [InlineKeyboardButton(text="🖼 Генерация картинок", callback_data="menu:generate")],
             [InlineKeyboardButton(text="💎 Пополнить баланс", callback_data="menu:buy")],
-            [InlineKeyboardButton(text="💎 Оформить подписку ", callback_data="buy:subscription")],
+            [InlineKeyboardButton(text="💳 Оформить подписку ", callback_data="buy:subscription")],
         ]
     )
 
@@ -58,7 +58,7 @@ def balance_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💎 Пополнить баланс", callback_data="menu:buy")],
-            [InlineKeyboardButton(text="💎 Оформить подписку ", callback_data="buy:subscription")],
+            [InlineKeyboardButton(text="💳 Оформить подписку ", callback_data="buy:subscription")],
             [InlineKeyboardButton(text="🖼 Генерация картинок", callback_data="menu:generate")],
         ]
     )

@@ -36,7 +36,7 @@ async def setup_commands(bot: Bot) -> None:
     user_commands = [
         BotCommand(command="start", description="🔄 Перезапуск"),
         BotCommand(command="menu", description="🏠 Главное меню"),
-        BotCommand(command="subscription", description=" Подписка"),
+        BotCommand(command="subscription", description="💳 Подписка"),
         BotCommand(command="generate", description="🎨 Генерация изображений"),
         BotCommand(command="buy", description="⭐ Пополнить баланс"),
         BotCommand(command="balance", description="💰 Мой баланс"),
