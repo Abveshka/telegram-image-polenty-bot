@@ -138,22 +138,21 @@ async def cb_method(callback: CallbackQuery) -> None:
     stars = config.get_subscription_stars_price(tier, days)
 
     text = (
-        f"<b>Подписка {cfg['title']}</b>, {config.PERIOD_LABELS[days]}\n\n"
-        f"💳 Картой: {price} ₽, с автопродлением\n"
+        f"<b>💎 Подписка {cfg['title']}</b>\n"
+        f"🗓 {config.PERIOD_LABELS[days]} • ⚡ {cfg['daily_limit']} ген/день"
     )
-    if stars:
-        text += f"⭐ Звёздами: {stars} ⭐, без автопродления (действует ровно оплаченный срок)\n"
+
     warn = svc.burn_warning(sub, tier, days)
     if warn:
-        text += f"\n{warn}"
+        text += f"\n\n⚠️ <i>{warn}</i>"
         if stars:
-            text += "\nПри оплате звёздами автопродление отключится."
-    text += "\n\nВыберите способ оплаты:"
+            text += "\n<i>При оплате звёздами автопродление будет отключено.</i>"
 
-    rows = [[_btn(f"💳 Картой — {price} ₽", f"buy:sub:c:{tier}:{days}")]]
+    rows = [[_btn(f"💳 Картой — {price} ₽ (автопродление)", f"buy:sub:c:{tier}:{days}")]]
     if stars:
-        rows.append([_btn(f"⭐ Звёздами — {stars} ⭐", f"buy:sub:s:{tier}:{days}")])
+        rows.append([_btn(f"⭐ Звёздами — {stars} ⭐ (без автопродления)", f"buy:sub:s:{tier}:{days}")])
     rows.append([_btn("🔙 Назад", f"buy:sub:t:{tier}")])
+
     await _safe_edit(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 @router.callback_query(F.data.startswith("buy:sub:c:"))
@@ -283,13 +282,14 @@ async def cb_pay_stars(callback: CallbackQuery) -> None:
         await callback.answer(str(e), show_alert=True)
         return
 
-    await callback.answer()
     cfg = config.SUBSCRIPTION_TIERS[tier]
+
     await callback.message.answer_invoice(
-        title=f"Подписка {cfg['title']}"[:32],
+        title=f"💎 Подписка {cfg['title']}"[:32],
         description=(
-            f"{config.PERIOD_LABELS[days]}, {cfg['daily_limit']} генераций в день. "
-            f"Без автопродления."
+            f"🗓 {config.PERIOD_LABELS[days]} "
+            f"• ⚡ {cfg['daily_limit']} ген/день "
+            f"• 🛡️ Без автопродления"
         ),
         payload=f"sub:{tier}:{days}",
         currency="XTR",

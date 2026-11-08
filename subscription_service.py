@@ -2,6 +2,8 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+
+from aiogram import Bot
 from sqlalchemy import select, update, func
 import config
 from sqlalchemy.exc import IntegrityError
@@ -761,3 +763,99 @@ async def activate_subscription_with_stars(
     except IntegrityError:
         logger.warning("Дубликат звёздного платежа: user=%s charge_id=%s", telegram_id, charge_id)
         return StarsOutcome("duplicate")
+
+
+@dataclass
+class StarsRefundOutcome:
+    kind: str  # refunded / failed
+    telegram_id: int
+    amount_stars: int
+    subscription_revoked: bool
+
+
+async def request_star_refund(
+        payment_id: str,  # здесь это telegram_charge_id из StarsPayment
+        revoke: bool = False,
+        bot: Bot = None,
+) -> StarsRefundOutcome:
+    """Возврат звёзд Telegram и опциональный отзыв подписки."""
+    async with async_session() as session:
+        pay = await session.scalar(
+            select(StarsPayment).where(StarsPayment.telegram_charge_id == payment_id)
+        )
+        if pay is None:
+            raise SubscriptionError(f"Платёж со Stars ID '{payment_id}' не найден.")
+
+        if pay.status == "refunded":
+            raise SubscriptionError("Этот платёж уже возвращен.")
+
+        user = await session.get(User, pay.user_id)
+        if user is None:
+            raise SubscriptionError("Пользователь не найден.")
+
+        # Вызываем метод Telegram API для возврата звёзд
+        try:
+            success = await bot.refund_star_payment(user.telegram_id, pay.telegram_charge_id)
+        except Exception as e:
+            logger.error("Ошибка при вызове refund_star_payment: %r", e, exc_info=True)
+            raise SubscriptionError("Не удалось выполнить возврат через Telegram API.")
+
+        if not success:
+            raise SubscriptionError("Telegram отклонил запрос на возврат звёзд.")
+
+        pay.status = "refunded"
+
+        revoked = False
+        if revoke and pay.subscription_id:
+            sub = await session.get(Subscription, pay.subscription_id)
+            if sub and sub.expires_at > datetime.now(timezone.utc):
+                # Сбрасываем подписку (или можно откатить expires_at назад)
+                sub.expires_at = datetime.now(timezone.utc)
+                sub.auto_renew = False
+                sub.payment_method_id = None
+                sub.next_charge_at = None
+                revoked = True
+
+        await session.commit()
+        return StarsRefundOutcome(
+            kind="refunded",
+            telegram_id=user.telegram_id,
+            amount_stars=pay.amount_stars,
+            subscription_revoked=revoked,
+        )
+
+
+async def manual_grant_for_stars_payment(payment_id: str) -> tuple[int, datetime]:
+    """Ручная выдача подписки для зависшего платежа StarsPayment (manual_review)."""
+    async with async_session() as session:
+        pay = await session.scalar(
+            select(StarsPayment).where(StarsPayment.telegram_charge_id == payment_id)
+        )
+        if pay is None:
+            raise SubscriptionError(f"Платёж со Stars ID '{payment_id}' не найден.")
+
+        if pay.status == "succeeded" and pay.subscription_id:
+            raise SubscriptionError("Подписка по этому платежу уже была успешно выдана ранее.")
+
+        user = await session.get(User, pay.user_id)
+        if user is None:
+            raise SubscriptionError("Пользователь не найден.")
+
+        # Выдаем подписку через grant_subscription
+        try:
+            expires_at = await grant_subscription(
+                session, user.id, pay.tier, pay.period_days,
+                extend=False, auto_renew=False,
+            )
+        except Exception as e:
+            logger.error("Ошибка при ручной выдаче подписки за звёзды: %r", e, exc_info=True)
+            raise SubscriptionError("Не удалось активировать подписку.")
+
+        sub_id = await session.scalar(
+            select(Subscription.id).where(Subscription.user_id == user.id)
+        )
+        pay.subscription_id = sub_id
+        pay.status = "succeeded"
+        await session.commit()
+
+        return user.telegram_id, expires_at

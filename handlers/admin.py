@@ -187,3 +187,65 @@ async def _notify_refund(bot: Bot, out: svc.RefundOutcome) -> None:
         await bot.send_message(out.telegram_id, text)
     except Exception:
         logger.warning("Не удалось уведомить %s о возврате", out.telegram_id)
+
+
+@router.message(Command("refund_stars_sub"))
+async def cmd_refund_stars(message: Message, command: CommandObject, bot: Bot) -> None:
+    """/refund_stars <telegram_charge_id> [revoke]"""
+    if not _is_admin(message):
+        return
+    tokens = (command.args or "").split()
+    if not tokens:
+        await message.answer("Формат: /refund_stars <telegram_charge_id> [revoke]")
+        return
+
+    charge_id = tokens[0]
+    revoke = "revoke" in tokens[1:]
+
+    try:
+        # ВЫЗЫВАЕМ ИМЕННО request_star_refund!
+        out = await svc.request_star_refund(charge_id, revoke=revoke, bot=bot)
+    except svc.SubscriptionError as e:
+        await message.answer(f"❌ {e}")
+        return
+
+    await message.answer(
+        f"✅ Возврат {out.amount_stars} ⭐ успешно выполнен"
+        + ("\nПодписка отозвана." if out.subscription_revoked else "")
+    )
+
+    try:
+        await bot.send_message(
+            out.telegram_id,
+            f"💸 Вам был выполнен возврат {out.amount_stars} ⭐."
+            + (" Подписка аннулирована." if out.subscription_revoked else "")
+        )
+    except Exception:
+        logger.warning("Не удалось уведомить пользователя %s о возврате звёзд", out.telegram_id)
+
+
+@router.message(Command("grant_stars_sub"))
+async def cmd_grant_stars_sub(message: Message, command: CommandObject, bot: Bot) -> None:
+    """/grant_stars_sub <telegram_charge_id>: выдать подписку за звёздный платёж в manual_review"""
+    if not _is_admin(message):
+        return
+    pid = (command.args or "").strip()
+    if not pid:
+        await message.answer("Формат: /grant_stars_sub <telegram_charge_id>")
+        return
+
+    try:
+        telegram_id, expires_at = await svc.manual_grant_for_stars_payment(pid)
+    except svc.SubscriptionError as e:
+        await message.answer(f"❌ {e}")
+        return
+
+    await message.answer(f"✅ Подписка за звёзды выдана до {_fmt(expires_at)} (МСК)")
+    try:
+        await bot.send_message(
+            telegram_id,
+            f"✅ Приносим извинения за задержку: ваша подписка за звёзды активирована до "
+            f"{_fmt(expires_at)} (МСК).",
+        )
+    except Exception:
+        logger.warning("Не удалось уведомить %s о ручной выдаче подписки за звёзды", telegram_id)
