@@ -81,6 +81,10 @@ TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL") or None
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 OPENROUTER_MANAGEMENT_KEY = os.environ["OPENROUTER_MANAGEMENT_KEY"]
 
+REQUIRED_CHANNELS = [
+    {"id": -1003747883634, "title": "ГЕНЕРАЦИИ ФОТО ‼️", "url": "https://t.me/linasgpt"},
+]
+
 PRICE_PER_GENERATION_STARS = 10
 STAR_PACKAGES = [
     #{"label": "TEST 1 ★ → 1 генерация", "credit_stars": 10, "stars_to_pay": 1, "rub_to_pay": 1},

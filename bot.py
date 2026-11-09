@@ -2,7 +2,7 @@ import sys
 import asyncio
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-import logging
+from subscription_check import SubscriptionMiddleware
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -15,11 +15,15 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 from subscription_worker import subscription_worker
 import yookassa_client
+import os
+
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 
 file_handler = TimedRotatingFileHandler(
-    "logs/bot.log",
-    when="midnight",   # новый файл каждый день
-    backupCount=14,    # хранить последние 14 дней, старые удаляются сами
+    os.path.join(LOG_DIR, "bot.log"),
+    when="midnight",
+    backupCount=14,
     encoding="utf-8",
 )
 
@@ -44,8 +48,30 @@ async def setup_commands(bot: Bot) -> None:
     await bot.set_my_commands(user_commands)
 
     admin_commands = user_commands + [
-        BotCommand(command="refund", description="↩️ Возврат платежа. Использование: /refund <charge_id>"),
-        BotCommand(command="compensate", description="🎁 Компенсация. Использование: /compensate <telegram_id> <количество> [код_обращения]"),
+        BotCommand(
+            command="refund",
+            description="↩️ Возврат ЮKassa: /refund <payment_id> [сумма] [revoke]",
+        ),
+        BotCommand(
+            command="refund_stars",
+            description="↩️ Возврат звёзд за токены: /refund_stars <charge_id>",
+        ),
+        BotCommand(
+            command="refund_stars_sub",
+            description="↩️ Возврат звёзд за подписку: /refund_stars_sub <charge_id> [revoke]",
+        ),
+        BotCommand(
+            command="compensate",
+            description="🎁 Компенсация: /compensate <telegram_id> <кол-во> [код_обращения]",
+        ),
+        BotCommand(
+            command="grant_sub",
+            description="✅ Выдать подписку (ЮKassa): /grant_sub <payment_id>",
+        ),
+        BotCommand(
+            command="grant_stars_sub",
+            description="✅ Выдать подписку (звёзды): /grant_stars_sub <charge_id>",
+        ),
     ]
     await bot.set_my_commands(
         admin_commands,
@@ -53,7 +79,6 @@ async def setup_commands(bot: Bot) -> None:
     )
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
     async with Bot(
@@ -62,6 +87,8 @@ async def main() -> None:
         session=AiohttpSession(proxy=config.TELEGRAM_PROXY_URL),
     ) as bot:
         dp = Dispatcher()
+        dp.message.outer_middleware(SubscriptionMiddleware())
+        dp.callback_query.outer_middleware(SubscriptionMiddleware())
         dp.include_router(router)
         await setup_commands(bot)
         if config.TELEGRAM_PROXY_URL:
