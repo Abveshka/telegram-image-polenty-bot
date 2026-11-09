@@ -2,9 +2,9 @@ meta:
   environment: python
   toolchain:
     name: pip
-    version: "3.11"
+    version: "3.13.5"
 build:
-  requirements: requirements.txt
+  requirementsPath: requirements.txt
 run:
   scriptName: bot.py
   persistenceMount: /data
