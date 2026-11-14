@@ -15,6 +15,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 from subscription_worker import subscription_worker
 import yookassa_client
+from support_bot import run_support_bot
 import os
 
 LOG_DIR = os.getenv("LOG_DIR", "logs")
@@ -44,6 +45,7 @@ async def setup_commands(bot: Bot) -> None:
         BotCommand(command="generate", description="🎨 Генерация изображений"),
         BotCommand(command="buy", description="⭐ Пополнить баланс"),
         BotCommand(command="balance", description="💰 Мой баланс"),
+        BotCommand(command="support", description="⚒️ Техподдержка"),
     ]
     await bot.set_my_commands(user_commands)
 
@@ -100,11 +102,13 @@ async def main() -> None:
             watch_openrouter_balance(provider._client, config.OPENROUTER_MANAGEMENT_KEY, bot)
         )
         sub_task = asyncio.create_task(subscription_worker(bot))
+        support_task = asyncio.create_task(run_support_bot())
         try:
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
         finally:
             watcher_task.cancel()
             sub_task.cancel()
+            support_task.cancel()
             await yookassa_client.aclose()
             aclose = getattr(provider, "aclose", None)
             if aclose is not None:

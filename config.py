@@ -60,6 +60,9 @@ RENEWAL_MAX_ATTEMPTS = 3
 RENEWAL_CHARGE_LEAD_HOURS = 1
 
 TELEGRAM_BOT_TOKEN = _get_required("TELEGRAM_BOT_TOKEN")
+SUPPORT_BOT_TOKEN=_get_required("SUPPORT_BOT_TOKEN")
+SUPPORT_GROUP_ID = int(os.getenv("SUPPORT_GROUP_ID", "0"))
+SUPPORT_URL = os.environ["SUPPORT_URL"]
 GEMINI_API_KEY = _get_required("GEMINI_API_KEY")
 DATABASE_URL = _get_required("DATABASE_URL")
 
@@ -82,7 +85,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 OPENROUTER_MANAGEMENT_KEY = os.environ["OPENROUTER_MANAGEMENT_KEY"]
 
 REQUIRED_CHANNELS = [
-    {"id": -1003747883634, "title": "ГЕНЕРАЦИИ ФОТО ‼️", "url": "https://t.me/linasgpt"},
+    {"id": int(os.getenv("REQUIRED_CHANNELS_ID", "0")), "title": "ГЕНЕРАЦИИ ФОТО ‼️", "url": "https://t.me/linasgpt"},
 ]
 
 PRICE_PER_GENERATION_STARS = 10

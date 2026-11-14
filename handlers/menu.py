@@ -1,7 +1,7 @@
 import html
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, InlineKeyboardButton
 import config
 from user_service import get_balance, get_or_create_user
 from .keyboards import main_menu_keyboard, start_menu_keyboard, balance_menu_keyboard
@@ -69,3 +69,13 @@ async def cb_balance(callback: CallbackQuery) -> None:
         f"Баланс: {balance} токенов (≈ {balance // config.PRICE_PER_GENERATION_STARS} генераций)",
         reply_markup=balance_menu_keyboard(),
     )
+
+@router.message(Command("support"))
+async def support_cmd(message: Message) -> None:
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🛟 Написать в поддержку",
+            url=config.SUPPORT_URL,
+        )
+    ]])
+    await message.answer("Если что-то пошло не так, напишите нам:", reply_markup=kb)

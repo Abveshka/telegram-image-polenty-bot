@@ -180,6 +180,24 @@ class StarsPayment(Base):
     status: Mapped[str] = mapped_column(String(16), default="succeeded", server_default="succeeded")  # succeeded / manual_review / refunded
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+class SupportTicket(Base):
+    __tablename__ = "support_tickets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"), unique=True, index=True
+    )
+    topic_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    status: Mapped[str] = mapped_column(
+        String(16), default="open", server_default="open"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    user: Mapped["User"] = relationship()
+
+
 _async_db_url = config.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 engine = create_async_engine(_async_db_url, echo=False)

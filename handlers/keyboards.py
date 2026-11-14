@@ -41,6 +41,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="💳 Оформить подписку ", callback_data="buy:subscription")],
             [InlineKeyboardButton(text="🖼 Генерация картинок", callback_data="menu:generate")],
             [InlineKeyboardButton(text="💰 Баланс", callback_data="menu:balance")],
+            [InlineKeyboardButton(text="🛟 Поддержка", url=config.SUPPORT_URL)],
         ]
     )
 

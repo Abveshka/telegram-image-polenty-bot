@@ -28,11 +28,26 @@ def _is_active(sub) -> bool:
     return sub is not None and sub.expires_at > datetime.now(timezone.utc)
 
 
+def _format_generations(n: int) -> str:
+    """Возвращает число с правильным окончанием слова 'генерация'."""
+    if 11 <= n % 100 <= 19:
+        return f"{n} генераций"
+
+    last_digit = n % 10
+    if last_digit == 1:
+        return f"{n} генерация"
+    elif 2 <= last_digit <= 4:
+        return f"{n} генерации"
+    else:
+        return f"{n} генераций"
+
+
 async def _main_screen(telegram_id: int) -> tuple[str, InlineKeyboardMarkup]:
     sub = await svc.get_subscription(telegram_id)
     lines = ["💳 <b>Подписка</b>", "", "Ежедневный лимит генераций, токены не тратятся:"]
     for cfg in config.SUBSCRIPTION_TIERS.values():
-        lines.append(f"{cfg['emoji']} <b>{cfg['title']}</b>: {cfg['daily_limit']} в день")
+        limit_text = _format_generations(cfg['daily_limit'])
+        lines.append(f"{cfg['emoji']} <b>{cfg['title']}</b>: {limit_text} в день")
 
     active = _is_active(sub)
     if active:
@@ -64,8 +79,6 @@ async def _safe_edit(callback: CallbackQuery, text: str, markup: InlineKeyboardM
     except Exception:
         logger.exception("edit_text: неожиданная ошибка")
 
-
-# ───────────── Навигация ─────────────
 
 @router.message(Command("subscription"))
 async def cmd_subscription(message: Message) -> None:
@@ -99,7 +112,8 @@ async def cb_tier(callback: CallbackQuery) -> None:
             label += f" / {stars} ⭐"
         rows.append([_btn(label, f"buy:sub:m:{tier}:{days}")])
     rows.append([_btn("🔙 Назад", "buy:subscription")])
-    text = f"{cfg['emoji']} <b>{cfg['title']}</b>: {cfg['daily_limit']} генераций в день\n\nВыберите период:"
+    limit_text = _format_generations(cfg['daily_limit'])
+    text = f"{cfg['emoji']} <b>{cfg['title']}</b>: {limit_text} в день\n\nВыберите период:"
     await _safe_edit(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
