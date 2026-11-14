@@ -6,6 +6,7 @@ meta:
 build:
   requirementsPath: requirements.txt
 run:
+  command: alembic upgrade head && python bot.py
   scriptName: bot.py
   persistenceMount: /data
   containerPort: 80
