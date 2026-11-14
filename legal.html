@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Правовая информация — LinasGPT | AI Photo</title>
+<style>
+:root {
+  --bg: #f6f4fb;
+  --surface: #ffffff;
+  --text: #1c1830;
+  --muted: #655f7a;
+  --line: #e2ddf0;
+  --accent: #6d3fd6;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14111f;
+    --surface: #1d192d;
+    --text: #ece9f7;
+    --muted: #a49eba;
+    --line: #322c48;
+    --accent: #a98bff;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main {
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 48px 20px 64px;
+}
+h1 {
+  font-size: 1.75rem;
+  line-height: 1.25;
+  margin: 0 0 8px;
+}
+.lead { color: var(--muted); margin: 0 0 32px; }
+.docs { display: grid; gap: 12px; padding: 0; margin: 0; list-style: none; }
+.docs a {
+  display: block;
+  padding: 18px 20px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 10px;
+  color: inherit;
+  text-decoration: none;
+}
+.docs a:hover { border-color: var(--accent); }
+.docs a:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.docs strong { display: block; font-size: 1.05rem; }
+.docs span { color: var(--muted); font-size: .92rem; }
+footer { margin-top: 32px; color: var(--muted); font-size: .9rem; }
+footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Правовая информация</h1>
+  <p class="lead">Документы, которые действуют при использовании бота LinasGPT | AI Photo. Нажимая «Старт» и пользуясь ботом, вы принимаете их условия.</p>
+
+  <ul class="docs">
+    <li>
+      <a href="index.html">
+        <strong>Публичная оферта</strong>
+        <span>Условия оказания услуг и оплаты</span>
+      </a>
+    </li>
+    <li>
+      <a href="privacy.html">
+        <strong>Пользовательское соглашение</strong>
+        <span>Правила использования бота и обработка персональных данных</span>
+      </a>
+    </li>
+  </ul>
+
+  <footer>
+    Вопросы по документам: <a href="https://t.me/linasSupportBot">техническая поддержка</a>
+  </footer>
+</main>
+</body>
+</html>
